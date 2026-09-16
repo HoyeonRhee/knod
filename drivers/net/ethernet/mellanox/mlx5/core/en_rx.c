@@ -61,6 +61,10 @@
 #include "devlink.h"
 #include "en/devlink.h"
 
+static bool knod_rx_admission;
+module_param_named(knod_rx_admission, knod_rx_admission, bool, 0644);
+MODULE_PARM_DESC(knod_rx_admission, "Limit KNOD RX polling to available SPSC slots");
+
 static struct sk_buff *
 mlx5e_skb_from_cqe_mpwrq_linear(struct mlx5e_rq *rq, struct mlx5e_mpw_info *wi,
 				struct mlx5_cqe64 *cqe, u16 cqe_bcnt, u32 head_offset,
@@ -2584,14 +2588,43 @@ static int mlx5e_rx_cq_process_basic_cqe_comp(struct mlx5e_rq *rq,
 	return work_done;
 }
 
+/* The NAPI producer may have descriptors not yet published to r->head.
+ * A concurrent consumer can only increase the available space.
+ */
+static int mlx5e_knod_rx_budget(struct mlx5e_rq *rq, int budget)
+{
+	struct spsc_ring *r = &rq->knodev->wpriv[rq->ix].spsc_bds;
+	u32 head = rq->knod_spsc_prod_valid ? rq->knod_spsc_prod_head :
+		READ_ONCE(r->head);
+	u32 used = head - smp_load_acquire(&r->tail);
+	u32 capacity = r->mask + 1;
+	u32 available = used >= capacity ? 0 : capacity - used;
+
+	return min_t(u32, budget, available);
+}
+
 int mlx5e_poll_rx_cq(struct mlx5e_cq *cq, int budget)
 {
 	struct mlx5e_rq *rq = container_of(cq, struct mlx5e_rq, cq);
 	struct mlx5_cqwq *cqwq = &cq->wq;
 	int work_done;
 
+	/* Per-call admission pressure, not a probe for pending CQEs. */
+	rq->knod_rx_budget_limited = false;
 	if (unlikely(!test_bit(MLX5E_RQ_STATE_ENABLED, &rq->state)))
 		return 0;
+
+	if (rq->knodev && READ_ONCE(knod_rx_admission) && budget > 0) {
+		int admitted = mlx5e_knod_rx_budget(rq, budget);
+
+		if (admitted < budget) {
+			rq->knod_rx_budget_limited = true;
+			budget = admitted;
+		}
+		/* Enhanced CQE processing requires a positive budget. */
+		if (!budget)
+			return 0;
+	}
 
 	if (test_bit(MLX5E_RQ_STATE_MINI_CQE_ENHANCED, &rq->state))
 		work_done = mlx5e_rx_cq_process_enhanced_cqe_comp(rq, cqwq,

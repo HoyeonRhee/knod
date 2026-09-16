@@ -222,6 +222,10 @@ int mlx5e_napi_poll(struct napi_struct *napi, int budget)
 						budget);
 	}
 
+	/* A reduced budget may have left CQEs pending. Repoll conservatively
+	 * after release can free slots, without requiring another arrival.
+	 */
+	busy |= rq->knod_rx_budget_limited;
 	busy |= work_done == budget;
 
 	mlx5e_poll_ico_cq(&c->icosq.cq);
@@ -300,6 +304,22 @@ int mlx5e_napi_poll(struct napi_struct *napi, int budget)
 	if (unlikely(aff_change && busy_xsk)) {
 		mlx5e_trigger_napi_async_icosq(c);
 		ch_stats->force_irq++;
+	} else if (unlikely(aff_change && rq->knod_rx_budget_limited &&
+			  READ_ONCE(rq->knodev) &&
+			  test_bit(MLX5E_RQ_STATE_ENABLED, &rq->state))) {
+		/* Admission can leave CQEs behind even after this poll retires
+		 * every completed GPU chunk. No later GPU kick is guaranteed.
+		 * The affinity fallback completed NAPI above, so explicitly
+		 * arrange another poll. An async IRQ preserves migration to
+		 * the channel CPU; channels without that SQ use NAPI's normal
+		 * scheduling protocol, which also handles concurrent disable.
+		 */
+		if (aicosq) {
+			mlx5e_trigger_napi_async_icosq(c);
+			ch_stats->force_irq++;
+		} else {
+			napi_schedule(napi);
+		}
 	}
 
 out:

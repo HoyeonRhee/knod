@@ -746,6 +746,8 @@ struct mlx5e_rq {
 	struct knod_netdev *knetdev;
 	u32                    knod_spsc_prod_head;
 	bool                   knod_spsc_prod_valid;
+	/* Admission reduced the requested RX budget; CQE presence is unknown. */
+	bool                   knod_rx_budget_limited;
 
 	/* AF_XDP zero-copy */
 	struct xsk_buff_pool  *xsk_pool;
