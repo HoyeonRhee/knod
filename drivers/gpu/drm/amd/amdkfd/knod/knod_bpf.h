@@ -254,7 +254,6 @@ struct knod_bpf_work_sq {
 	struct knod_mem *param;
 	int queue_idx[KNOD_SPSC_MAX];
 	ktime_t dispatch_time;
-	s64 sigval;
 	unsigned long expire;
 	int backlogs;
 };
@@ -550,11 +549,14 @@ struct knod_bpf_priv {
 	u64 queue_base_gaddr[KNOD_SPSC_MAX];
 	struct knod_bpf_work_sq *inflight[KNOD_BPF_INFLIGHT];
 	unsigned int inflight_cnt;
+	bool dispatch_fault;
 	ktime_t next_dispatch_time;
 	struct task_struct *worker_task;
 	struct list_head free_list_sqw;
 	struct mutex map_op_lock;
 	bool map_op_quiesce;
+	bool maps_gc_pending;
+	u64 map_op_request, map_op_ack;
 	wait_queue_head_t map_op_wq;
 	/* maps awaiting deferred free by the worker */
 	struct list_head dead_maps;

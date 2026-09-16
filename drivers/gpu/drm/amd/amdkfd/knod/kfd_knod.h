@@ -225,6 +225,7 @@ struct knod_dispatch_params {
 	u32 group_segment_size;
 	u64 kernel_object;
 	u64 kernarg_address;
+	u64 completion_signal;
 };
 
 /* The header a shader dump opens with.  knod-disasm reads the target and the
@@ -277,7 +278,8 @@ knod_setup_dispatch(struct knod *knod, int idx,
 	dp->group_segment_size = p->group_segment_size;
 	dp->kernel_object = p->kernel_object;
 	dp->kernarg_address = (void *)p->kernarg_address;
-	dp->completion_signal = knod->kaql[q_idx].queue_signal->gaddr;
+	dp->completion_signal = p->completion_signal ? p->completion_signal :
+		knod->kaql[q_idx].queue_signal->gaddr;
 	/* publish the packet body before the valid header (WRITE_ONCE below) */
 	wmb();
 	WRITE_ONCE(dp->header,

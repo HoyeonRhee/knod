@@ -544,6 +544,14 @@ static unsigned int knod_bpf_active_rxq_count(struct net_device *netdev)
 	return min_t(unsigned int, nr_rxq, num_possible_cpus());
 }
 
+#define KNOD_SQ_SIGNAL_OFFSET ALIGN(sizeof(struct knod_bpf_param), 64)
+#define KNOD_SQ_PARAM_BYTES (KNOD_SQ_SIGNAL_OFFSET + sizeof(struct amd_signal))
+
+static struct amd_signal *knod_bpf_sqw_signal(struct knod_bpf_work_sq *sqw)
+{
+	return (void *)((char *)sqw->param->kaddr + KNOD_SQ_SIGNAL_OFFSET);
+}
+
 static void knod_bpf_fill_dispatch(struct knod_bpf_priv *priv,
 				   struct knod_bpf_work_sq *sqw,
 				   struct knod_dispatch_params *p)
@@ -558,6 +566,7 @@ static void knod_bpf_fill_dispatch(struct knod_bpf_priv *priv,
 	p->group_segment_size = priv->lds_bytes[idx];
 	p->kernel_object = (u64)priv->knod->kernels[idx]->gaddr;
 	p->kernarg_address = sqw->param->gaddr;
+	p->completion_signal = sqw->param->gaddr + KNOD_SQ_SIGNAL_OFFSET;
 }
 
 static void debug_kernel_descriptor(struct kernel_descriptor *kernel_code)
@@ -1030,16 +1039,15 @@ static void knod_submit_bpf(struct knod_bpf_priv *priv,
 			     struct knod_bpf_work_sq *sqw)
 {
 	struct amd_signal *signal =
-		(struct amd_signal *)priv->knod->kaql[0].queue_signal->kaddr;
+		knod_bpf_sqw_signal(sqw);
 	struct knod_bpf_stats *stats = &priv->stats;
 	struct knod_dispatch_params p;
 	int i, bucket = KNOD_BL_BUCKETS - 1;
 
-	/* The @inflight_cnt dispatches already in flight decrement the signal
-	 * before this one, so this sqw completes when the signal drops below
-	 * (current value - inflight_cnt).
-	 */
-	sqw->sigval = signal->value - priv->inflight_cnt;
+	/* Only the owner resets this signal after its previous completion. */
+	WARN_ON_ONCE(READ_ONCE(signal->value));
+	WRITE_ONCE(signal->value, 1);
+	dma_wmb();
 	sqw->expire = jiffies + msecs_to_jiffies(knod_bpf_expire);
 	if (static_branch_unlikely(&knod_stats_key)) {
 		sqw->dispatch_time = ktime_get();
@@ -1538,52 +1546,40 @@ free_all:
 	return err;
 }
 
-static void knod_bpf_reset_sqw(struct knod_bpf_work_sq *sqw)
-{
-	if (!sqw)
-		return;
-
-	sqw->backlogs = 0;
-	sqw->expire = 0;
-}
-
 static void knod_bpf_wait_sqw(struct knod_bpf_priv *priv,
 			      struct knod_bpf_work_sq *sqw)
 {
-	struct amd_signal *signal;
-	unsigned long deadline;
+	struct amd_signal *signal = knod_bpf_sqw_signal(sqw);
+	unsigned long deadline = jiffies + msecs_to_jiffies(1000);
+	bool warned = false;
 
-	if (!sqw)
-		return;
-
-	signal = (struct amd_signal *)
-		priv->knod->kaql[0].queue_signal->kaddr;
-	deadline = jiffies + msecs_to_jiffies(1000);
-
-	while (sqw->sigval <= READ_ONCE(signal->value) &&
-	       time_before(jiffies, deadline))
+	/* A timeout does not revoke GPU ownership of the backing storage. */
+	while (READ_ONCE(signal->value)) {
+		if (!warned && time_after(jiffies, deadline)) {
+			pr_warn("knod: retaining incomplete GPU dispatch during stop\n");
+			warned = true;
+		}
 		usleep_range(100, 200);
-
-	if (sqw->sigval <= READ_ONCE(signal->value))
-		pr_warn("knod: timed out waiting for GPU dispatch completion\n");
+	}
+	dma_rmb();
 }
 
 static void knod_bpf_drain_worker(struct knod_bpf_priv *priv)
 {
 	struct knod_bpf_work_sq *sqw;
 
-	/* stop() runs on interface-down AND on every feature switch, both
-	 * with mlx5 RX possibly still producing into knodev->wpriv[].spsc_bds.
-	 * So we only quiesce the GPU here; the NIC-owned RX SPSC rings are
-	 * drained on interface-down by mlx5e_rx_offload_stop().
-	 */
+	/* Completion can be out of order; SPSC retirement must stay FIFO. */
 	while (priv->inflight_cnt) {
-		sqw = priv->inflight[--priv->inflight_cnt];
-		priv->inflight[priv->inflight_cnt] = NULL;
+		sqw = priv->inflight[0];
 		knod_bpf_wait_sqw(priv, sqw);
-		knod_bpf_reset_sqw(sqw);
-		list_add_tail_rcu(&sqw->list, &priv->free_list_sqw);
+		if (--priv->inflight_cnt)
+			memmove(priv->inflight, priv->inflight + 1,
+				priv->inflight_cnt * sizeof(priv->inflight[0]));
+		priv->inflight[priv->inflight_cnt] = NULL;
+		knod_complete_acquire(priv, sqw);
+		knod_complete_napi(priv, sqw);
 	}
+	WRITE_ONCE(priv->dispatch_fault, false);
 }
 
 static void knod_bpf_drain(struct knod_bpf_priv *priv)
@@ -1593,6 +1589,8 @@ static void knod_bpf_drain(struct knod_bpf_priv *priv)
 
 static void knod_bpf_stop_worker(struct knod_bpf_priv *priv)
 {
+	/* Exclude host mutations until the stopped worker's GPU work retires. */
+	mutex_lock(&priv->map_op_lock);
 	priv->start = 0;
 	if (priv->worker_task) {
 		kthread_stop(priv->worker_task);
@@ -1600,12 +1598,13 @@ static void knod_bpf_stop_worker(struct knod_bpf_priv *priv)
 		priv->worker_task = NULL;
 	}
 	synchronize_net();
+	knod_bpf_drain(priv);
+	mutex_unlock(&priv->map_op_lock);
 }
 
 static void knod_bpf_configure_worker(struct knod_bpf_priv *priv)
 {
 	knod_bpf_stop_worker(priv);
-	knod_bpf_drain(priv);
 
 	priv->inflight_cnt = 0;
 }
@@ -1614,13 +1613,18 @@ static int knod_bpf_start_worker(struct knod_bpf_priv *priv)
 {
 	struct task_struct *p;
 
+	/* A no-worker map operation must finish before submissions restart. */
+	mutex_lock(&priv->map_op_lock);
 	p = kthread_run(knod_bpf_worker, priv, "knod_%d_0",
 			priv->knodev->accel->id);
-	if (IS_ERR(p))
+	if (IS_ERR(p)) {
+		mutex_unlock(&priv->map_op_lock);
 		return PTR_ERR(p);
+	}
 
 	get_task_struct(p);
 	priv->worker_task = p;
+	mutex_unlock(&priv->map_op_lock);
 	return 0;
 }
 
@@ -1689,7 +1693,6 @@ static void knod_bpf_stop(struct knod_dev *knodev)
 		(struct knod_bpf_priv *)knodev->accel->xdp.priv;
 
 	knod_bpf_stop_worker(priv);
-	knod_bpf_drain(priv);
 
 	kfree(priv->pass_prog_buf);
 	priv->pass_prog_buf = NULL;
@@ -2448,6 +2451,7 @@ static void knod_bpf_map_free(struct knod_dev *knodev,
 	mutex_lock(&knodev->lock);
 	list_del(&knod_map->list);
 	list_add(&knod_map->list, &priv->dead_maps);
+	WRITE_ONCE(priv->maps_gc_pending, true);
 	mutex_unlock(&knodev->lock);
 	offmap->dev_priv = NULL;
 }
@@ -2502,27 +2506,36 @@ static int __knod_bpf_map_lookup_elem(struct bpf_offloaded_map *offmap,
 
 #define KNOD_MAP_QUIESCE_MS	100
 
-static void knod_bpf_map_op_begin(struct knod_bpf_priv *priv)
+static int knod_bpf_map_op_begin(struct knod_bpf_priv *priv)
 {
-	/* A cached map is written between dispatches, not under one. */
+	u64 request;
+
 	mutex_lock(&priv->map_op_lock);
-
 	if (!priv->worker_task)
-		return;
+		return 0;
 
+	/* Publish the request before the worker acknowledges this generation. */
+	request = priv->map_op_request + 1;
 	WRITE_ONCE(priv->map_op_quiesce, true);
-	if (!wait_event_timeout(priv->map_op_wq, !priv->inflight_cnt,
-				msecs_to_jiffies(KNOD_MAP_QUIESCE_MS)))
-		pr_warn_once("knod_bpf: map op did not see the pipe empty in %ums; a dispatch is stuck\n",
-			     KNOD_MAP_QUIESCE_MS);
+	smp_store_release(&priv->map_op_request, request);
+	/* Empty depth alone can race with an unpublished submission. */
+	if (!wait_event_timeout(priv->map_op_wq,
+				smp_load_acquire(&priv->map_op_ack) == request,
+				msecs_to_jiffies(KNOD_MAP_QUIESCE_MS))) {
+		WRITE_ONCE(priv->dispatch_fault, true);
+		WRITE_ONCE(priv->map_op_quiesce, false);
+		mutex_unlock(&priv->map_op_lock);
+		return -ETIMEDOUT;
+	}
+	return 0;
 }
 
 static void knod_bpf_map_op_end(struct knod_bpf_priv *priv)
 {
-	WRITE_ONCE(priv->map_op_quiesce, false);
-	wake_up(&priv->map_op_wq);
-
+	/* Make host writes visible before allowing another GPU dispatch. */
 	knod_bpf_gpu_mem_fence(priv);
+	smp_store_release(&priv->map_op_quiesce, false);
+	wake_up(&priv->map_op_wq);
 	mutex_unlock(&priv->map_op_lock);
 }
 
@@ -2576,7 +2589,9 @@ static int __knod_bpf_map_update_elem(struct bpf_offloaded_map *offmap,
 				    list) {
 			if (knod_map->knod_map_obj == knod_map_obj) {
 				mutex_unlock(&knodev->lock);
-				knod_bpf_map_op_begin(priv);
+				ret = knod_bpf_map_op_begin(priv);
+				if (ret)
+					return ret;
 				ret = knod_bpf_map_hash_update_elem(knod_map,
 						knod_map_obj,
 								    key, value);
@@ -2608,7 +2623,9 @@ static int __knod_bpf_map_delete_elem(struct bpf_offloaded_map *offmap,
 		return 0;
 	else if (knod_map_obj->map_type == BPF_MAP_TYPE_HASH ||
 		 knod_map_obj->map_type == BPF_MAP_TYPE_PERCPU_HASH) {
-		knod_bpf_map_op_begin(priv);
+		ret = knod_bpf_map_op_begin(priv);
+		if (ret)
+			return ret;
 		ret = knod_bpf_map_hash_delete_elem(knod_map, knod_map_obj,
 						    key);
 		knod_bpf_map_op_end(priv);
@@ -2679,8 +2696,8 @@ static void knod_bpf_map_gc_process(struct knod_bpf_map *knod_map)
  * rcu_read_lock_bh, since knod_free_mem() may sleep).  All bound_maps access
  * is serialized under knodev->lock -- the same lock map_alloc/map_free use:
  * GC live HASH maps, then reap maps that detach moved onto dead_maps.  The
- * worker only reaches here after completing the previous dispatch, so the
- * clean atomic flip guarantees the GPU no longer reads a reaped map's BOs.
+ * caller holds map_op_lock with the dispatch pipe empty. Pending maintenance
+ * suppresses new submissions until this function and its write fence finish.
  */
 #define KNOD_BPF_MAPS_TICK_INTERVAL 65536
 
@@ -2690,14 +2707,6 @@ static void knod_bpf_maps_tick(struct knod_bpf_priv *priv)
 	struct knod_bpf_map *knod_map, *tmp;
 	LIST_HEAD(reap);
 
-	if (list_empty(&knodev->accel->xdp.bound_maps) &&
-	    list_empty(&priv->dead_maps))
-		return;
-
-	if (list_empty(&priv->dead_maps) &&
-	    (++priv->maps_tick_skip & (KNOD_BPF_MAPS_TICK_INTERVAL - 1)))
-		return;
-
 	mutex_lock(&knodev->lock);
 	list_for_each_entry(knod_map, &knodev->accel->xdp.bound_maps, list) {
 		if (knod_map->knod_map_obj->map_type == BPF_MAP_TYPE_HASH ||
@@ -2705,6 +2714,8 @@ static void knod_bpf_maps_tick(struct knod_bpf_priv *priv)
 			knod_bpf_map_gc_process(knod_map);
 	}
 	list_splice_init(&priv->dead_maps, &reap);
+	/* A later map_free republishes its request under this same lock. */
+	WRITE_ONCE(priv->maps_gc_pending, false);
 	mutex_unlock(&knodev->lock);
 
 	list_for_each_entry_safe(knod_map, tmp, &reap, list) {
@@ -2758,6 +2769,9 @@ static bool knod_bpf_submit_work(struct knod_bpf_priv *priv)
 	struct knod_bpf_work_sq *sqw;
 	struct knod_bpf_stats *stats = &priv->stats;
 	ktime_t dispatch_start;
+
+	if (READ_ONCE(priv->dispatch_fault))
+		return false;
 
 	if (priv->inflight_cnt >= KNOD_BPF_INFLIGHT)
 		return false;
@@ -2828,20 +2842,18 @@ static bool knod_bpf_poll_complete(struct knod_bpf_priv *priv,
 	if (!sqw)
 		return false;
 
-	signal = (struct amd_signal *)
-		priv->knod->kaql[0].queue_signal->kaddr;
+	signal = knod_bpf_sqw_signal(sqw);
 
-	if (sqw->sigval > READ_ONCE(signal->value)) {
+	if (!READ_ONCE(signal->value)) {
+		dma_rmb();
 		knod_bpf_record_completion(priv, sqw);
 		return true;
 	}
 
-	if (time_after(jiffies, sqw->expire)) {
+	if (time_after(jiffies, sqw->expire) && !READ_ONCE(priv->dispatch_fault)) {
 		priv->stats.expire_count++;
-		pr_warn_ratelimited("knod_bpf: poll expire (sigval=%lld signal=%lld expire_ms=%u)\n",
-			sqw->sigval, READ_ONCE(signal->value), knod_bpf_expire);
-		knod_bpf_record_completion(priv, sqw);
-		return true;
+		WRITE_ONCE(priv->dispatch_fault, true);
+		pr_warn("knod: dispatch timed out; retaining GPU-owned buffers\n");
 	}
 
 	return false;
@@ -2865,6 +2877,7 @@ static int knod_bpf_worker(void *arg)
 	struct knod_bpf_work_sq *sqw;
 	bool progressed;
 	bool quiesce;
+	u64 map_request;
 
 	while (!kthread_should_stop()) {
 		if (kthread_should_park()) {
@@ -2873,15 +2886,27 @@ static int knod_bpf_worker(void *arg)
 			continue;
 		}
 
-		knod_bpf_maps_tick(priv);
+		/* Advance the maintenance cadence even while the pipe stays full. */
+		if (!(++priv->maps_tick_skip & (KNOD_BPF_MAPS_TICK_INTERVAL - 1)))
+			WRITE_ONCE(priv->maps_gc_pending, true);
+
+		/* Reclaim map elements only after all GPU users have completed,
+		 * and exclude host map mutations while processing their free lists.
+		 */
+		if (READ_ONCE(priv->maps_gc_pending) && !priv->inflight_cnt &&
+		    !READ_ONCE(priv->map_op_quiesce) &&
+		    mutex_trylock(&priv->map_op_lock)) {
+			knod_bpf_maps_tick(priv);
+			knod_bpf_gpu_mem_fence(priv);
+			mutex_unlock(&priv->map_op_lock);
+		}
 
 		progressed = false;
-		quiesce = READ_ONCE(priv->map_op_quiesce);
+		quiesce = smp_load_acquire(&priv->map_op_quiesce);
+		map_request = quiesce ? smp_load_acquire(&priv->map_op_request) : 0;
 
 		rcu_read_lock_bh();
-		/* Retire completed dispatches oldest-first: the signal is
-		 * monotonic so inflight[0] finishes before inflight[1..].
-		 */
+		/* Retire in SPSC order, checking each dispatch's own signal. */
 		while (priv->inflight_cnt &&
 		       knod_bpf_poll_complete(priv, priv->inflight[0])) {
 			sqw = priv->inflight[0];
@@ -2895,13 +2920,18 @@ static int knod_bpf_worker(void *arg)
 			progressed = true;
 		}
 
+		if (!priv->inflight_cnt)
+			WRITE_ONCE(priv->dispatch_fault, false);
+
 		/* Keep the pipe full: dispatch ahead up to KNOD_BPF_INFLIGHT.
 		 * Staging self-limits, so this stops once the ring is drained.
 		 */
 		if (unlikely(quiesce)) {
-			if (!priv->inflight_cnt)
+			if (!priv->inflight_cnt) {
+				smp_store_release(&priv->map_op_ack, map_request);
 				wake_up(&priv->map_op_wq);
-		} else {
+			}
+		} else if (!READ_ONCE(priv->maps_gc_pending)) {
 			while (knod_bpf_submit_work(priv))
 				progressed = true;
 		}
@@ -2944,15 +2974,18 @@ static void knod_bpf_sq_init(struct knod_bpf_priv *priv)
 			continue;
 
 		sqw->param = knod_alloc_mem(priv->knod,
-					    sizeof(struct knod_bpf_param),
+					    KNOD_SQ_PARAM_BYTES,
 					    KFD_IOC_ALLOC_MEM_FLAGS_GTT |
 					    KFD_IOC_ALLOC_MEM_FLAGS_WRITABLE |
 					    KFD_IOC_ALLOC_MEM_FLAGS_COHERENT);
-		if (!sqw->param) {
+		if (IS_ERR_OR_NULL(sqw->param)) {
 			kvfree(sqw);
 			continue;
 		}
-		memset(sqw->param->kaddr, 0, sizeof(struct knod_bpf_param));
+		memset(sqw->param->kaddr, 0, KNOD_SQ_PARAM_BYTES);
+		*knod_bpf_sqw_signal(sqw) = *(struct amd_signal *)
+			priv->knod->kaql[0].queue_signal->kaddr;
+		knod_bpf_sqw_signal(sqw)->value = 0;
 		INIT_LIST_HEAD(&sqw->list);
 		list_add(&sqw->list, &priv->free_list_sqw);
 		sqw->backlogs = 0;
@@ -2966,7 +2999,7 @@ static void knod_bpf_free_sqw(struct knod_bpf_priv *priv,
 		return;
 
 	knod_free_mem(priv->knod, sqw->param);
-	kfree(sqw);
+	kvfree(sqw);
 }
 
 static void knod_bpf_free_sqw_list(struct knod_bpf_priv *priv,
@@ -2986,7 +3019,6 @@ static void knod_bpf_sq_exit(struct knod_bpf_priv *priv)
 		return;
 
 	knod_bpf_stop_worker(priv);
-	knod_bpf_drain(priv);
 
 	knod_bpf_free_sqw_list(priv, &priv->free_list_sqw);
 	priv->inflight_cnt = 0;
@@ -3042,6 +3074,15 @@ static int knod_priv_init(struct knod_bpf_priv *priv)
 	int index;
 
 	priv->prog = NULL;
+	INIT_LIST_HEAD(&priv->free_list_sqw);
+	priv->worker_task = NULL;
+	priv->inflight_cnt = 0;
+	priv->dispatch_fault = false;
+	priv->map_op_request = 0;
+	priv->map_op_ack = 0;
+	priv->map_op_quiesce = false;
+	priv->maps_gc_pending = false;
+	priv->maps_tick_skip = 0;
 	mutex_init(&priv->map_op_lock);
 	init_waitqueue_head(&priv->map_op_wq);
 	INIT_LIST_HEAD(&priv->dead_maps);
@@ -3091,6 +3132,10 @@ static int knod_priv_init(struct knod_bpf_priv *priv)
 	 */
 
 	knod_bpf_sq_init(priv);
+	if (list_empty(&priv->free_list_sqw)) {
+		knod_priv_exit(priv);
+		return -ENOMEM;
+	}
 
 	return 0;
 }
@@ -7080,11 +7125,22 @@ static int knod_bpf_jit(struct knod_dev *knodev,
 		 * offset should not be minus.
 		 */
 		case BPF_ALU | BPF_MOV | BPF_X:
+			if (off)
+				return -EOPNOTSUPP;
+			knod_mov32(priv, meta, bpf_reg64[d].lo, bpf_reg64[s].lo);
+			knod_iset32(&p32[0], 0);
+			knod_mov32(priv, meta, bpf_reg64[d].hi, p32[0]);
+			break;
 		case BPF_ALU64 | BPF_MOV | BPF_X:
+			if (off)
+				return -EOPNOTSUPP;
 			//r[d] = r[s];
 			knod_mov64(priv, meta, bpf_reg64[d], bpf_reg64[s]);
 			break;
 		case BPF_ALU | BPF_MOV | BPF_K:
+			knod_iset64(&p64[0], (u32)imm);
+			knod_mov64(priv, meta, bpf_reg64[d], p64[0]);
+			break;
 		case BPF_ALU64 | BPF_MOV | BPF_K:
 			//r[d] = imm;
 			knod_iset64(&p64[0], imm);
@@ -7161,8 +7217,11 @@ static int knod_bpf_jit(struct knod_dev *knodev,
 			knod_iset32(&p32[0], imm);
 			knod_and32(priv, meta, bpf_reg64[d].lo, p32[0],
 				       bpf_reg64[d].lo);
-			knod_iset32(&p32[0], 0);
-			knod_mov32(priv, meta, bpf_reg64[d].hi, p32[0]);
+			/* ALU64 immediates sign-extend: a negative mask keeps high. */
+			if (BPF_CLASS(meta->insn.code) == BPF_ALU || imm >= 0) {
+				knod_iset32(&p32[0], 0);
+				knod_mov32(priv, meta, bpf_reg64[d].hi, p32[0]);
+			}
 			break;
 		case BPF_ALU | BPF_OR | BPF_X:
 			knod_or32(priv, meta, bpf_reg64[d].lo,
@@ -7183,8 +7242,12 @@ static int knod_bpf_jit(struct knod_dev *knodev,
 			knod_iset32(&p32[0], imm);
 			knod_or32(priv, meta,
 				bpf_reg64[d].lo, p32[0], bpf_reg64[d].lo);
-			knod_iset32(&p32[0], 0);
-			knod_mov32(priv, meta, bpf_reg64[d].hi, p32[0]);
+			/* Positive ALU64 OR preserves high; negative OR sets it. */
+			if (BPF_CLASS(meta->insn.code) == BPF_ALU || imm < 0) {
+				knod_iset32(&p32[0],
+					    BPF_CLASS(meta->insn.code) == BPF_ALU ? 0 : U32_MAX);
+				knod_mov32(priv, meta, bpf_reg64[d].hi, p32[0]);
+			}
 			break;
 		case BPF_ALU | BPF_ADD | BPF_X:
 			knod_add32(priv, meta, bpf_reg64[d].lo,
@@ -8139,7 +8202,7 @@ static int knod_bpf_jit(struct knod_dev *knodev,
 			knod_emit(priv, meta, v_mov_b32_e32, param[0],
 				  param[1]);
 			knod_vset32(&param[0], KNOD_AMDGPU_TMP_VREG0_HI);
-			knod_iset32(&param[1], 0);
+			knod_iset32(&param[1], (s32)imm < 0 ? U32_MAX : 0);
 			knod_emit(priv, meta, v_mov_b32_e32, param[0],
 				  param[1]);
 			knod_vset32(&param[0], d * 2);
@@ -8179,7 +8242,7 @@ static int knod_bpf_jit(struct knod_dev *knodev,
 			knod_emit(priv, meta, v_mov_b32_e32, param[0],
 				  param[1]);
 			knod_vset32(&param[0], KNOD_AMDGPU_TMP_VREG0_HI);
-			knod_iset32(&param[1], 0);
+			knod_iset32(&param[1], (s32)imm < 0 ? U32_MAX : 0);
 			knod_emit(priv, meta, v_mov_b32_e32, param[0],
 				  param[1]);
 			knod_vset64(&param64[0], d * 2);
@@ -8219,7 +8282,7 @@ static int knod_bpf_jit(struct knod_dev *knodev,
 			knod_emit(priv, meta, v_mov_b32_e32, param[0],
 				  param[1]);
 			knod_vset32(&param[0], KNOD_AMDGPU_TMP_VREG0_HI);
-			knod_iset32(&param[1], 0);
+			knod_iset32(&param[1], (s32)imm < 0 ? U32_MAX : 0);
 			knod_emit(priv, meta, v_mov_b32_e32, param[0],
 				  param[1]);
 			knod_vset64(&param64[0], d * 2);
@@ -8259,7 +8322,7 @@ static int knod_bpf_jit(struct knod_dev *knodev,
 			knod_emit(priv, meta, v_mov_b32_e32, param[0],
 				  param[1]);
 			knod_vset32(&param[0], KNOD_AMDGPU_TMP_VREG0_HI);
-			knod_iset32(&param[1], 0);
+			knod_iset32(&param[1], (s32)imm < 0 ? U32_MAX : 0);
 			knod_emit(priv, meta, v_mov_b32_e32, param[0],
 				  param[1]);
 			knod_vset64(&param64[0], d * 2);
@@ -8299,7 +8362,7 @@ static int knod_bpf_jit(struct knod_dev *knodev,
 			knod_emit(priv, meta, v_mov_b32_e32, param[0],
 				  param[1]);
 			knod_vset32(&param[0], KNOD_AMDGPU_TMP_VREG0_HI);
-			knod_iset32(&param[1], 0);
+			knod_iset32(&param[1], (s32)imm < 0 ? U32_MAX : 0);
 			knod_emit(priv, meta, v_mov_b32_e32, param[0],
 				  param[1]);
 			knod_vset64(&param64[0], d * 2);
@@ -8339,7 +8402,7 @@ static int knod_bpf_jit(struct knod_dev *knodev,
 			knod_emit(priv, meta, v_mov_b32_e32, param[0],
 				  param[1]);
 			knod_vset32(&param[0], KNOD_AMDGPU_TMP_VREG0_HI);
-			knod_iset32(&param[1], 0);
+			knod_iset32(&param[1], (s32)imm < 0 ? U32_MAX : 0);
 			knod_emit(priv, meta, v_mov_b32_e32, param[0],
 				  param[1]);
 			knod_vset64(&param64[0], d * 2);
@@ -8379,7 +8442,7 @@ static int knod_bpf_jit(struct knod_dev *knodev,
 			knod_emit(priv, meta, v_mov_b32_e32, param[0],
 				  param[1]);
 			knod_vset32(&param[0], KNOD_AMDGPU_TMP_VREG0_HI);
-			knod_iset32(&param[1], 0);
+			knod_iset32(&param[1], (s32)imm < 0 ? U32_MAX : 0);
 			knod_emit(priv, meta, v_mov_b32_e32, param[0],
 				  param[1]);
 			knod_vset64(&param64[0], d * 2);
@@ -8419,7 +8482,7 @@ static int knod_bpf_jit(struct knod_dev *knodev,
 			knod_emit(priv, meta, v_mov_b32_e32, param[0],
 				  param[1]);
 			knod_vset32(&param[0], KNOD_AMDGPU_TMP_VREG0_HI);
-			knod_iset32(&param[1], 0);
+			knod_iset32(&param[1], (s32)imm < 0 ? U32_MAX : 0);
 			knod_emit(priv, meta, v_mov_b32_e32, param[0],
 				  param[1]);
 			knod_vset64(&param64[0], d * 2);
@@ -8459,7 +8522,7 @@ static int knod_bpf_jit(struct knod_dev *knodev,
 			knod_emit(priv, meta, v_mov_b32_e32, param[0],
 				  param[1]);
 			knod_vset32(&param[0], KNOD_AMDGPU_TMP_VREG0_HI);
-			knod_iset32(&param[1], 0);
+			knod_iset32(&param[1], (s32)imm < 0 ? U32_MAX : 0);
 			knod_emit(priv, meta, v_mov_b32_e32, param[0],
 				  param[1]);
 			knod_vset64(&param64[0], d * 2);
@@ -8504,7 +8567,7 @@ static int knod_bpf_jit(struct knod_dev *knodev,
 			knod_emit(priv, meta, v_mov_b32_e32, param[0],
 				  param[1]);
 			knod_vset32(&param[0], KNOD_AMDGPU_TMP_VREG0_HI);
-			knod_iset32(&param[1], 0);
+			knod_iset32(&param[1], (s32)imm < 0 ? U32_MAX : 0);
 			knod_emit(priv, meta, v_mov_b32_e32, param[0],
 				  param[1]);
 			knod_vset32(&param[0], d * 2);
@@ -8561,7 +8624,7 @@ static int knod_bpf_jit(struct knod_dev *knodev,
 			knod_emit(priv, meta, v_mov_b32_e32, param[0],
 				  param[1]);
 			knod_vset32(&param[0], KNOD_AMDGPU_TMP_VREG0_HI);
-			knod_iset32(&param[1], 0);
+			knod_iset32(&param[1], (s32)imm < 0 ? U32_MAX : 0);
 			knod_emit(priv, meta, v_mov_b32_e32, param[0],
 				  param[1]);
 			knod_vset32(&param[0], d * 2);

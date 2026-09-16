@@ -1462,6 +1462,7 @@ static void knod_ipsec_fill_dispatch(struct knod *knod,
 	p->kernel_object = work->kernel_object ? work->kernel_object :
 			   (u64)knod->kernels[0]->gaddr;
 	p->kernarg_address = work->param.gaddr;
+	p->completion_signal = 0;
 }
 
 /*
