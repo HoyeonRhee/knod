@@ -250,6 +250,8 @@ struct knod_packet {
 
 /* Single Queue Worok */
 struct knod_bpf_work_sq {
+	u64 persistent_sequence;
+	u32 persistent_slot;
 	struct list_head list;
 	struct knod_mem *param;
 	int queue_idx[KNOD_SPSC_MAX];
@@ -695,6 +697,10 @@ struct knod_bpf_priv {
 	struct knod_bpf_work_sq *inflight[KNOD_BPF_INFLIGHT];
 	unsigned int inflight_cnt;
 	bool dispatch_fault;
+	struct knod_mem *persistent_mem;
+	bool persistent_running;
+	u32 persistent_slot;
+	u64 persistent_sequence, persistent_launches;
 	ktime_t next_dispatch_time;
 	struct task_struct *worker_task;
 	struct list_head free_list_sqw;

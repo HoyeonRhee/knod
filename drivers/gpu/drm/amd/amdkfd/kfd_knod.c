@@ -55,6 +55,7 @@
 #include <drm/ttm/ttm_tt.h>
 #include <linux/seq_file.h>
 #include "knod_bpf.h"
+#include "knod_persistent.h"
 #include <net/page_pool/helpers.h>
 #include <linux/netdevice.h>
 #include <linux/firmware.h>
@@ -895,6 +896,10 @@ int knod_blob_load(struct knod *knod, struct knod_blob *blob, const char *what)
 			KNOD_BLOB_ABI_VERSION);
 		goto out;
 	}
+	if (le32_to_cpu(hdr->reserved) !=
+	    (!strcmp(what, "bpf-persistent") ? KNOD_PERSIST_VERSION : 0))
+		goto out;
+
 	if (le32_to_cpu(hdr->isa) != (u32)knod->isa_version) {
 		pr_warn("knod: %s was built for gfx%u\n", name,
 			le32_to_cpu(hdr->isa));
@@ -2028,6 +2033,8 @@ static int knod_attach(struct knod_dev *knodev)
 	 * are allocated when the feature is selected (->activate).
 	 */
 	knod->active_feature = KNOD_FEATURE_NONE;
+	knod->coherent_control_required = false;
+	knod->control_mem_coherent = false;
 
 	/*
 	 * Permanent per-attach feature state (e.g. the BPF bpf_offload_dev,
@@ -2106,12 +2113,14 @@ static void *knod_accel_alloc_mem(struct knod_dev *knodev, size_t size,
 	 * GTT; only host-read delivery buffers need coherent CPU visibility.
 	 */
 	flags = KFD_IOC_ALLOC_MEM_FLAGS_GTT | KFD_IOC_ALLOC_MEM_FLAGS_WRITABLE;
-	if (pages)
+	if (pages || knod->coherent_control_required)
 		flags |= KFD_IOC_ALLOC_MEM_FLAGS_COHERENT;
 
 	mem = knod_alloc_mem(knod, size, flags);
 	if (IS_ERR(mem))
 		return NULL;
+	if (!pages)
+		knod->control_mem_coherent = !!(flags & KFD_IOC_ALLOC_MEM_FLAGS_COHERENT);
 
 	if (pages) {
 		tt = mem->mem->bo ? mem->mem->bo->tbo.ttm : NULL;

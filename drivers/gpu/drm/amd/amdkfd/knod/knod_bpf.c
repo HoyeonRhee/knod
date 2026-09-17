@@ -564,6 +564,69 @@ static struct amd_signal *knod_bpf_sqw_signal(struct knod_bpf_work_sq *sqw)
 	return (void *)((char *)sqw->param->kaddr + KNOD_SQ_SIGNAL_OFFSET);
 }
 
+#include "knod_persistent.h"
+
+static bool knod_bpf_persistent;
+module_param_named(persistent, knod_bpf_persistent, bool, 0444);
+MODULE_PARM_DESC(persistent, "Keep one resident workgroup per RX queue");
+
+struct knod_persistent_mem {
+	struct knod_persistent_control control;
+	struct amd_signal terminal;
+};
+static_assert(sizeof(struct knod_persistent_slot) == KNOD_PERSIST_SLOT_BYTES);
+static_assert(offsetof(struct knod_persistent_control, slots) == KNOD_PERSIST_SLOT_BASE);
+static_assert(offsetof(struct knod_persistent_slot, done) == KNOD_PERSIST_DONE);
+static_assert(sizeof(struct knod_persistent_mem) <= PAGE_SIZE);
+
+static bool knod_bpf_sqw_done(struct knod_bpf_priv *priv,
+			      struct knod_bpf_work_sq *sqw)
+{
+	struct amd_signal *signal = knod_bpf_sqw_signal(sqw);
+	struct knod_persistent_mem *mem;
+	struct knod_persistent_slot *slot;
+	unsigned int i;
+
+	if (!READ_ONCE(signal->value))
+		return true;
+	if (!knod_bpf_persistent)
+		return false;
+	mem = priv->persistent_mem->kaddr;
+	slot = &mem->control.slots[sqw->persistent_slot];
+	for (i = 0; i < priv->nr_works; i++)
+		if (READ_ONCE(slot->done[i]) != sqw->persistent_sequence)
+			return false;
+	dma_rmb();
+	WRITE_ONCE(signal->value, 0);
+	return true;
+}
+
+static void knod_bpf_persistent_stop(struct knod_bpf_priv *priv)
+{
+	struct knod_persistent_mem *mem;
+	unsigned long deadline;
+	bool warned = false;
+
+	if (!priv->persistent_running)
+		return;
+	might_sleep();
+	mem = priv->persistent_mem->kaddr;
+	/* Caller has drained every published chunk. Never discard a request. */
+	WARN_ON_ONCE(priv->inflight_cnt);
+	dma_wmb();
+	WRITE_ONCE(mem->control.stop, 1);
+	deadline = jiffies + msecs_to_jiffies(1000);
+	while (READ_ONCE(mem->terminal.value)) {
+		if (!warned && time_after(jiffies, deadline)) {
+			pr_warn("knod: retaining resident shader backing pending terminal completion\n");
+			warned = true;
+		}
+		usleep_range(100, 200);
+	}
+	dma_rmb();
+	priv->persistent_running = false;
+}
+
 static void knod_bpf_fill_dispatch(struct knod_bpf_priv *priv,
 				   struct knod_bpf_work_sq *sqw,
 				   struct knod_dispatch_params *p)
@@ -1051,6 +1114,43 @@ static struct knod_bpf_work_sq *knod_prepare_bpf(struct knod_bpf_priv *priv)
 	return sqw;
 }
 
+static void knod_bpf_publish_chunk(struct knod_bpf_priv *priv,
+				   struct knod_bpf_work_sq *sqw)
+{
+	struct knod_persistent_mem *mem = priv->persistent_mem->kaddr;
+	struct knod_persistent_slot *slot;
+	struct knod_dispatch_params p;
+
+	if (!priv->persistent_running) {
+		memset(mem, 0, sizeof(*mem));
+		mem->control.version = KNOD_PERSIST_VERSION;
+		mem->terminal = *(struct amd_signal *)priv->knod->kaql[0].queue_signal->kaddr;
+		mem->terminal.value = 1;
+		priv->persistent_sequence = 0;
+		priv->persistent_slot = 0;
+	}
+	/* 64-bit sequence reuse would require a drained restart. */
+
+	sqw->persistent_sequence = ++priv->persistent_sequence;
+	sqw->persistent_slot = priv->persistent_slot;
+	slot = &mem->control.slots[priv->persistent_slot];
+	priv->persistent_slot = (priv->persistent_slot + 1) % KNOD_PERSIST_SLOTS;
+	WRITE_ONCE(slot->param, sqw->param->gaddr);
+	wmb();
+	WRITE_ONCE(slot->ready, sqw->persistent_sequence);
+	dma_wmb();
+	if (priv->persistent_running)
+		return;
+	knod_bpf_fill_dispatch(priv, sqw, &p);
+	p.kernarg_address = priv->persistent_mem->gaddr;
+	p.completion_signal = priv->persistent_mem->gaddr +
+		offsetof(struct knod_persistent_mem, terminal);
+	wmb();
+	knod_setup_header(priv->knod, &p, 0);
+	priv->persistent_running = true;
+	priv->persistent_launches++;
+}
+
 /* Submit a prepared sqw: write AQL packet, ring doorbell, record stats. */
 static void knod_submit_bpf(struct knod_bpf_priv *priv,
 			     struct knod_bpf_work_sq *sqw)
@@ -1087,6 +1187,10 @@ static void knod_submit_bpf(struct knod_bpf_priv *priv,
 		stats->backlogs_hist[bucket]++;
 	}
 
+	if (knod_bpf_persistent) {
+		knod_bpf_publish_chunk(priv, sqw);
+		return;
+	}
 	knod_bpf_fill_dispatch(priv, sqw, &p);
 	/* publish dispatch params before the AQL packet becomes visible */
 	wmb();
@@ -1271,11 +1375,36 @@ static void knod_complete_napi(struct knod_bpf_priv *priv,
 	}
 }
 
+/* Resident code changes must wait for terminal completion, not just a chunk.
+ * The worker acknowledges this generation only after stopping the resident
+ * shader. A hung GPU retains its code and maps rather than racing an upload.
+ * Start and stop use the same mutex, including the no-worker path.
+ */
+static void knod_bpf_code_op_begin(struct knod_bpf_priv *priv)
+{
+	u64 request;
+
+	mutex_lock(&priv->map_op_lock);
+	if (!priv->worker_task)
+		return;
+	request = priv->map_op_request + 1;
+	WRITE_ONCE(priv->map_op_quiesce, true);
+	smp_store_release(&priv->map_op_request, request);
+	wait_event(priv->map_op_wq,
+		   smp_load_acquire(&priv->map_op_ack) == request);
+}
+
+static void knod_bpf_code_op_end(struct knod_bpf_priv *priv)
+{
+	knod_bpf_gpu_mem_fence(priv);
+	smp_store_release(&priv->map_op_quiesce, false);
+	wake_up(&priv->map_op_wq);
+	mutex_unlock(&priv->map_op_lock);
+}
+
 /*
- * Install kernel code into the inactive slot and atomically flip the active
- * index.  The active slot is never modified while the GPU dispatches it, so
- * the swap never races the live pipeline, and the worker is not touched: new
- * dispatches pick up the new slot, the in-flight one finishes on the old slot.
+ * Install into the selected code slot and publish its index after the upload.
+ * Resident execution must terminate before either slot can be reused.
  */
 static void knod_bpf_install_kernel(struct knod_bpf_priv *priv,
 				    const struct knod_prog *knod_prog,
@@ -1291,6 +1420,9 @@ static void knod_bpf_install_kernel(struct knod_bpf_priv *priv,
 	if (!code || !size || !knod->kernels[1])
 		return;
 
+	if (knod_bpf_persistent)
+		knod_bpf_code_op_begin(priv);
+
 	/*
 	 * Before the worker runs, install in place; once it is dispatching,
 	 * stage into the inactive slot and flip the active index so the live
@@ -1305,7 +1437,7 @@ static void knod_bpf_install_kernel(struct knod_bpf_priv *priv,
 	kd = slot->kaddr;
 	entry_off = kd->kernel_code_entry_byte_offset;
 	if (WARN_ON(entry_off >= slot->size))
-		return;
+		goto out;
 	if (WARN_ON(size > slot->size - entry_off))
 		size = slot->size - entry_off;
 	image_len = entry_off + size;
@@ -1333,6 +1465,9 @@ static void knod_bpf_install_kernel(struct knod_bpf_priv *priv,
 
 	if (idx != priv->active_idx)
 		WRITE_ONCE(priv->active_idx, idx);
+out:
+	if (knod_bpf_persistent)
+		knod_bpf_code_op_end(priv);
 }
 
 /*
@@ -1566,12 +1701,11 @@ free_all:
 static void knod_bpf_wait_sqw(struct knod_bpf_priv *priv,
 			      struct knod_bpf_work_sq *sqw)
 {
-	struct amd_signal *signal = knod_bpf_sqw_signal(sqw);
 	unsigned long deadline = jiffies + msecs_to_jiffies(1000);
 	bool warned = false;
 
 	/* A timeout does not revoke GPU ownership of the backing storage. */
-	while (READ_ONCE(signal->value)) {
+	while (!knod_bpf_sqw_done(priv, sqw)) {
 		if (!warned && time_after(jiffies, deadline)) {
 			pr_warn("knod: retaining incomplete GPU dispatch during stop\n");
 			warned = true;
@@ -1596,6 +1730,7 @@ static void knod_bpf_drain_worker(struct knod_bpf_priv *priv)
 		knod_complete_acquire(priv, sqw);
 		knod_complete_napi(priv, sqw);
 	}
+	knod_bpf_persistent_stop(priv);
 	WRITE_ONCE(priv->dispatch_fault, false);
 }
 
@@ -1716,17 +1851,24 @@ static void knod_bpf_stop(struct knod_dev *knodev)
 	priv->pass_prog_size = 0;
 }
 
-/*
- * Flip the dispatched kernel back to pass-through when the XDP prog is
- * detached.  The pass slot already holds the pass code, so this is just an
- * atomic index flip -- no re-copy.
- */
+/* Restore PASS on detach; resident execution may have reused both slots. */
 static void knod_bpf_reload_pass(struct knod_dev *knodev)
 {
 	struct knod_bpf_priv *priv = knodev->accel->xdp.priv;
 
-	if (priv)
+	if (!priv)
+		return;
+	if (knod_bpf_persistent) {
+		/* Two code slots can have been reused since PASS was installed. */
+		if (priv->pass_knod_prog && priv->pass_prog_buf) {
+			knod_bpf_install_kernel(priv, priv->pass_knod_prog,
+						priv->pass_prog_buf,
+						priv->pass_prog_size);
+			priv->pass_idx = READ_ONCE(priv->active_idx);
+		}
+	} else {
 		WRITE_ONCE(priv->active_idx, priv->pass_idx);
+	}
 }
 
 static void knod_setup_bpf_prog(struct bpf_prog *prog)
@@ -2789,6 +2931,9 @@ static bool knod_bpf_submit_work(struct knod_bpf_priv *priv)
 
 	if (READ_ONCE(priv->dispatch_fault))
 		return false;
+	if (knod_bpf_persistent && priv->persistent_running &&
+	    priv->persistent_sequence == U64_MAX)
+		return false;
 
 	if (priv->inflight_cnt >= KNOD_BPF_INFLIGHT)
 		return false;
@@ -2854,14 +2999,10 @@ static void knod_bpf_record_completion(struct knod_bpf_priv *priv,
 static bool knod_bpf_poll_complete(struct knod_bpf_priv *priv,
 				   struct knod_bpf_work_sq *sqw)
 {
-	struct amd_signal *signal;
-
 	if (!sqw)
 		return false;
 
-	signal = knod_bpf_sqw_signal(sqw);
-
-	if (!READ_ONCE(signal->value)) {
+	if (knod_bpf_sqw_done(priv, sqw)) {
 		dma_rmb();
 		knod_bpf_record_completion(priv, sqw);
 		return true;
@@ -2913,6 +3054,7 @@ static int knod_bpf_worker(void *arg)
 		if (READ_ONCE(priv->maps_gc_pending) && !priv->inflight_cnt &&
 		    !READ_ONCE(priv->map_op_quiesce) &&
 		    mutex_trylock(&priv->map_op_lock)) {
+			knod_bpf_persistent_stop(priv);
 			knod_bpf_maps_tick(priv);
 			knod_bpf_gpu_mem_fence(priv);
 			mutex_unlock(&priv->map_op_lock);
@@ -2944,15 +3086,22 @@ static int knod_bpf_worker(void *arg)
 		 * Staging self-limits, so this stops once the ring is drained.
 		 */
 		if (unlikely(quiesce)) {
-			if (!priv->inflight_cnt) {
-				smp_store_release(&priv->map_op_ack, map_request);
-				wake_up(&priv->map_op_wq);
-			}
+			/* Acknowledge outside RCU after any resident shader stops. */
 		} else if (!READ_ONCE(priv->maps_gc_pending)) {
 			while (knod_bpf_submit_work(priv))
 				progressed = true;
 		}
 		rcu_read_unlock_bh();
+
+		/* The terminal wait may sleep. No RCU read lock may cross it. */
+		if (quiesce && !priv->inflight_cnt) {
+			knod_bpf_persistent_stop(priv);
+			smp_store_release(&priv->map_op_ack, map_request);
+			wake_up(&priv->map_op_wq);
+		} else if (knod_bpf_persistent && !priv->inflight_cnt &&
+			   priv->persistent_running && priv->persistent_sequence == U64_MAX) {
+			knod_bpf_persistent_stop(priv);
+		}
 
 		if (!priv->inflight_cnt) {
 			knod_bpf_schedule_pending_napi(priv);
@@ -2963,7 +3112,7 @@ static int knod_bpf_worker(void *arg)
 			 * pipe, and not while the pacing window is still open
 			 * and the next submit is due.
 			 */
-			if (quiesce || knod_bpf_poll_mode)
+			if (quiesce || knod_bpf_poll_mode || knod_bpf_persistent)
 				cpu_relax();
 			else if (priv->inflight_cnt < KNOD_BPF_INFLIGHT &&
 				 ktime_before(ktime_get(), priv->next_dispatch_time))
@@ -3038,6 +3187,10 @@ static void knod_bpf_sq_exit(struct knod_bpf_priv *priv)
 	knod_bpf_stop_worker(priv);
 
 	knod_bpf_free_sqw_list(priv, &priv->free_list_sqw);
+	if (priv->persistent_mem) {
+		knod_free_mem(priv->knod, priv->persistent_mem);
+		priv->persistent_mem = NULL;
+	}
 	priv->inflight_cnt = 0;
 }
 
@@ -3112,6 +3265,13 @@ static int knod_priv_init(struct knod_bpf_priv *priv)
 		return -EINVAL;
 	}
 
+	if (knod_bpf_persistent &&
+	    (priv->isa_version != 10 || knod_bpf_jit_engine != 1 ||
+	     knod_bpf_wgp || knod_bpf_workgroups != 256 ||
+	     knod_bpf_cycle_probe || priv->nr_works > priv->knod->cu_count))
+		return -EOPNOTSUPP;
+	if (knod_bpf_persistent && !priv->knod->control_mem_coherent)
+		return -EOPNOTSUPP;
 	priv->prog_buf = kzalloc(KNOD_BPF_PROG_BUF_SIZE, GFP_KERNEL);
 	if (!priv->prog_buf)
 		return -ENOMEM;
@@ -3148,6 +3308,16 @@ static int knod_priv_init(struct knod_bpf_priv *priv)
 	 * NAPI drain recycles, so no per-feature delivery BO is allocated here.
 	 */
 
+	if (knod_bpf_persistent) {
+		priv->persistent_mem = knod_alloc_mem(priv->knod, PAGE_SIZE,
+			KFD_IOC_ALLOC_MEM_FLAGS_GTT | KFD_IOC_ALLOC_MEM_FLAGS_WRITABLE |
+			KFD_IOC_ALLOC_MEM_FLAGS_COHERENT);
+		if (IS_ERR_OR_NULL(priv->persistent_mem)) {
+			priv->persistent_mem = NULL;
+			knod_priv_exit(priv);
+			return -ENOMEM;
+		}
+	}
 	knod_bpf_sq_init(priv);
 	if (list_empty(&priv->free_list_sqw)) {
 		knod_priv_exit(priv);
@@ -3176,7 +3346,8 @@ static struct knod_bpf_priv *__knod_accel_xdp_init(struct knod_accel *accel,
 	 * to splice, so a missing or ABI-mismatched blob fails the attach
 	 * rather than deferring to a program that then cannot be built.
 	 */
-	err = knod_blob_load(knod, &priv->blob, "bpf");
+	err = knod_blob_load(knod, &priv->blob,
+			     knod_bpf_persistent ? "bpf-persistent" : "bpf");
 	if (err) {
 		kfree(priv);
 		return ERR_PTR(err);
@@ -3223,6 +3394,7 @@ static struct knod_bpf_priv *__knod_accel_xdp_init(struct knod_accel *accel,
 	priv->dev = knodev->netdev;
 
 	priv->isa_version = knod->isa_version;
+	knod->coherent_control_required = knod_bpf_persistent;
 
 	/*
 	 * Only permanent per-attach state is set up here; the GPU compute
@@ -13923,6 +14095,7 @@ static int knod_stats_show(struct seq_file *s, void *unused)
 	 */
 	seq_puts(s, "\n--- geometry ---\n");
 	seq_printf(s, "channels:            %d\n", priv->nr_works);
+	seq_printf(s, "execution_mode:      %s\n", knod_bpf_persistent ? "persistent_chunks" : "aql_batches");
 	seq_printf(s, "workgroup_size:      %u\n", knod_bpf_workgroups);
 	seq_printf(s, "groups_per_queue:    %d\n",
 		   knod_bpf_workgroups ? priv->batch_size /
