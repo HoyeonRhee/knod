@@ -198,6 +198,18 @@ static_assert(sizeof(struct knod_bpf_subparam_obj) ==
 /* The lane's byte offset into the LDS stack, lane * 4, computed once. */
 #define KNOD_AMDGPU_LDS_BASE_VREG	130
 
+#define KNOD_AMDGPU_RDNA_LDS_VREG0 70
+static_assert(KNOD_AMDGPU_RDNA_LDS_VREG0 > KNOD_AMDGPU_PAGE_BASE_VREG_HI);
+static_assert(KNOD_AMDGPU_RDNA_LDS_VREG0 + 2 < 80);
+
+static unsigned int knod_bpf_lds_vreg(const struct knod_bpf_priv *priv,
+				    unsigned int reg)
+{
+	if (priv->isa_version == 10 || priv->isa_version == 11)
+		return KNOD_AMDGPU_RDNA_LDS_VREG0 + reg - KNOD_AMDGPU_STACK_WIN_VREG0;
+	return reg;
+}
+
 /* One VGPR holds four bytes of packet, so what the cache can hold is decided
  * by how many VGPRs sit between its base and the stack.
  */
@@ -446,7 +458,7 @@ static void knod_bpf_emit_lds_base_init(struct knod_bpf_priv *priv,
 {
 	struct amdgcn_param32 base, idx, k;
 
-	knod_vset32(&base, KNOD_AMDGPU_LDS_BASE_VREG);
+	knod_vset32(&base, knod_bpf_lds_vreg(priv, KNOD_AMDGPU_LDS_BASE_VREG));
 	knod_vset32(&idx, KNOD_AMDGPU_IDX_VREG);
 	knod_iset32(&k, knod_bpf_workgroups - 1);
 	knod_and32(priv, meta, base, k, idx);
@@ -798,6 +810,10 @@ static void kfd_kernel_gfx9_init(struct knod *knod)
  * mem_ordered - has the same value on both, which is what the IPsec
  * shader found when it was measured on each.
  */
+static unsigned int knod_bpf_vgpr_reserve = 80;
+module_param_named(vgpr_reserve, knod_bpf_vgpr_reserve, uint, 0444);
+MODULE_PARM_DESC(vgpr_reserve, "Native VGPR allocation: 80, 128, or 256");
+
 static void kfd_kernel_rdna_init(struct knod *knod)
 {
 	struct kernel_descriptor *kernel_code = knod->kernels[0]->kaddr;
@@ -850,10 +866,10 @@ static void kfd_kernel_rdna_init(struct knod *knod)
 
 	if (kernel_code->code_properties.enable_wavefront_size32 == 1)
 		kernel_code->compute_pgm_rsrc1.granulated_workitem_vgpr_count =
-			(256 / 8) - 1;
+			(knod_bpf_vgpr_reserve / 8) - 1;
 	else
 		kernel_code->compute_pgm_rsrc1.granulated_workitem_vgpr_count =
-			(256 / 4) - 1;
+			(knod_bpf_vgpr_reserve / 4) - 1;
 	kernel_code->compute_pgm_rsrc1.granulated_wavefront_sgpr_count = 0;
 	kernel_code->compute_pgm_rsrc1.priority = 0;
 	kernel_code->compute_pgm_rsrc1.float_round_mode_32 = 0;
@@ -3147,6 +3163,10 @@ static struct knod_bpf_priv *__knod_accel_xdp_init(struct knod_accel *accel,
 	struct knod_bpf_priv *priv;
 	int err;
 
+	if (knod_bpf_vgpr_reserve != 80 && knod_bpf_vgpr_reserve != 128 &&
+	    knod_bpf_vgpr_reserve != 256)
+		return ERR_PTR(-EINVAL);
+
 	priv = kzalloc_obj(struct knod_bpf_priv, GFP_KERNEL);
 	if (!priv)
 		return ERR_PTR(-ENOMEM);
@@ -3312,38 +3332,58 @@ static struct knod_insn_meta *knod_bpf_goto_meta(struct knod_prog *knod_prog,
 	return meta;
 }
 
+static int knod_bpf_native_stack_offset(const struct bpf_reg_state *reg,
+				       int frame, int *offset)
+{
+	s64 off = (s64)reg->var_off.value;
+
+	if (reg->type != PTR_TO_STACK || reg->frameno != frame ||
+	    !tnum_is_const(reg->var_off) || off < -512 || off > 0)
+		return -EOPNOTSUPP;
+	*offset = off;
+	return 0;
+}
+
+static int knod_bpf_native_stack_arg(struct knod_bpf_reg_state *saved,
+				     const struct bpf_reg_state *reg, int frame)
+{
+	int off, err;
+
+	err = knod_bpf_native_stack_offset(reg, frame, &off);
+	if (err)
+		return err;
+	if (saved->reg.type != NOT_INIT &&
+	    (saved->reg.type != PTR_TO_STACK || saved->stack_off != off ||
+	     saved->reg.frameno != reg->frameno))
+		return -EOPNOTSUPP;
+	saved->reg = *reg;
+	saved->stack_off = off;
+	return 0;
+}
+
 static int knod_bpf_check_stack_access(struct knod_prog *knod_prog,
 				       struct knod_insn_meta *meta,
 				       const struct bpf_reg_state *reg,
 				       struct bpf_verifier_env *env)
 {
-	s32 old_off, new_off;
+	int off, err;
 
-	if (reg->frameno != env->cur_state->curframe)
-		meta->flags |= FLAG_INSN_PTR_CALLER_STACK_FRAME;
-
-	if (!tnum_is_const(reg->var_off)) {
-		knod_jit_dbg(" variable ptr stack access\n");
-		return -EINVAL;
-	}
-
-	if (meta->ptr.type == NOT_INIT)
-		return 0;
-
-	old_off = meta->ptr.var_off.value;
-	new_off = reg->var_off.value;
-
-	meta->ptr_not_const |= old_off != new_off;
-
-	if (!meta->ptr_not_const)
-		return 0;
-
-	if (old_off % 4 == new_off % 4)
-		return 0;
-
-	knod_jit_dbg(" stack access changed location was:%d is:%d\n",
-		old_off, new_off);
-	return -EINVAL;
+	err = knod_bpf_native_stack_offset(reg, env->cur_state->curframe, &off);
+	if (err)
+		return err;
+	/* Equal alignment is insufficient: the emitted LDS offset is fixed. */
+	if (meta->ptr.type != NOT_INIT &&
+	    (meta->ptr.type != PTR_TO_STACK ||
+	     meta->ptr.var_off.value != reg->var_off.value ||
+	     meta->ptr.frameno != reg->frameno))
+		return -EOPNOTSUPP;
+	if (BPF_CLASS(meta->insn.code) == BPF_LDX)
+		meta->sreg.stack_off = off;
+	else
+		meta->dreg.stack_off = off;
+	knod_prog->max_stack_off = min(knod_prog->max_stack_off,
+				      off + meta->insn.off);
+	return 0;
 }
 
 static struct knod_insn_meta *
@@ -3405,32 +3445,24 @@ static int knod_bpf_update_ptr_off(struct knod_prog *knod_prog,
 	struct knod_insn_meta *prev_meta;
 
 	if (is_mbpf_load(meta)) {
-		if (sreg->reg.type == PTR_TO_PACKET ||
-		    sreg->reg.type == PTR_TO_STACK) {
+		if (sreg->reg.type == PTR_TO_PACKET) {
 			prev_meta = knod_bpf_lookup_prev_meta_by_dreg(
 				knod_prog, meta, meta->insn.src_reg);
 			if (!prev_meta) {
 				knod_jit_dbg(" Invalid\n");
 				return -EINVAL;
 			}
-			if (sreg->reg.type == PTR_TO_PACKET)
-				sreg->packet_off = prev_meta->dreg.packet_off;
-			else
-				sreg->stack_off = prev_meta->dreg.stack_off;
+			sreg->packet_off = prev_meta->dreg.packet_off;
 		}
 	} else if (is_mbpf_store(meta)) {
-		if (dreg->reg.type == PTR_TO_PACKET ||
-		    dreg->reg.type == PTR_TO_STACK) {
+		if (dreg->reg.type == PTR_TO_PACKET) {
 			prev_meta = knod_bpf_lookup_prev_meta_by_dreg(
 				knod_prog, meta, meta->insn.dst_reg);
 			if (!prev_meta) {
 				knod_jit_dbg(" Invalid\n");
 				return -EINVAL;
 			}
-			if (dreg->reg.type == PTR_TO_PACKET)
-				dreg->packet_off = prev_meta->dreg.packet_off;
-			else
-				dreg->stack_off = prev_meta->dreg.stack_off;
+			dreg->packet_off = prev_meta->dreg.packet_off;
 		}
 	}
 
@@ -3530,6 +3562,9 @@ static int knod_bpf_check_percpu_store(struct knod_prog *knod_prog,
 	struct knod_insn_meta *alu, *load;
 	const char *why;
 
+	meta->percpu_rmw_add = NULL;
+	meta->percpu_rmw_swapped = false;
+	meta->percpu_rmw_uniform = false;
 	alu = knod_bpf_lookup_prev_meta_by_dreg(knod_prog, meta,
 						meta->insn.src_reg);
 	if (!alu || !is_mbpf_alu(alu))
@@ -3571,6 +3606,72 @@ static int knod_bpf_check_percpu_store(struct knod_prog *knod_prog,
 		 */
 		why = "this GPU has no 64-bit atomic, so no form of a 64-bit counter offloads; make it __u32";
 		goto reject;
+	}
+
+	/* A DW repair must preserve the full ALU64 addition, not an ALU32
+	 * truncation/zero-extension followed by a wider write.
+	 */
+	if (BPF_SIZE(load->insn.code) != BPF_SIZE(meta->insn.code) ||
+	    (BPF_SIZE(meta->insn.code) == BPF_DW &&
+	     mbpf_class(alu) != BPF_ALU64) ||
+	    (meta->percpu_rmw_swapped && BPF_SRC(alu->insn.code) != BPF_X) ||
+	    (BPF_SRC(alu->insn.code) == BPF_X &&
+	     alu->insn.src_reg == alu->insn.dst_reg)) {
+		why = "counter load/add/store widths or source versions do not match";
+		goto reject;
+	}
+	{
+		struct knod_insn_meta *m = load;
+		bool after_add = false;
+
+		/* Keep the repaired RMW in one straight-line value-version
+		 * region. Atomics (including FETCH), helpers and partial CFG
+		 * joins are not covered by the ALU/load-only clobber ledger.
+		 */
+		list_for_each_entry_continue(m, &knod_prog->insns, l) {
+			if (m->is_merge_point || (m->flags & FLAG_INSN_IS_JUMP_DST)) {
+				why = "counter RMW crosses a control-flow join";
+				goto reject;
+			}
+			if (m == meta)
+				break;
+			if (!(is_mbpf_alu(m) || is_mbpf_load(m)) ||
+			    m->insn.dst_reg == meta->insn.dst_reg ||
+			    (after_add && BPF_SRC(alu->insn.code) == BPF_X &&
+			     m->insn.dst_reg == alu->insn.src_reg)) {
+				why = "counter source or address is changed before its store";
+				goto reject;
+			}
+			if (m == alu)
+				after_add = true;
+		}
+		if (m != meta || !after_add) {
+			why = "counter RMW does not have a straight-line ADD";
+			goto reject;
+		}
+	}
+
+	{
+		struct knod_insn_meta *m;
+
+		/* Verifier callbacks precede CFG annotation. Check raw targets
+		 * as well, rather than treating unset merge flags as a proof.
+		 */
+		list_for_each_entry(m, &knod_prog->insns, l) {
+			int cls = mbpf_class(m), op = BPF_OP(m->insn.code);
+			s64 target;
+
+			if ((cls != BPF_JMP && cls != BPF_JMP32) ||
+			    op == BPF_CALL || op == BPF_EXIT)
+				continue;
+			target = (s64)m->bpf_insn_idx + 1 +
+				 (cls == BPF_JMP32 && op == BPF_JA ?
+				  m->insn.imm : m->insn.off);
+			if (target > load->bpf_insn_idx && target <= meta->bpf_insn_idx) {
+				why = "counter RMW has an alternate incoming path";
+				goto reject;
+			}
+		}
 	}
 
 	meta->percpu_rmw_add = alu;
@@ -4093,6 +4194,21 @@ static int knod_bpf_check_alu(struct knod_prog *knod_prog,
 	return 0;
 }
 
+static int knod_bpf_check_global_offset(unsigned int isa, unsigned int engine,
+					 const struct bpf_insn *insn,
+					 enum bpf_reg_type type)
+{
+	unsigned int cls = BPF_CLASS(insn->code);
+
+	if (isa != 10 || engine != 1 || BPF_MODE(insn->code) != BPF_MEM ||
+	    (cls != BPF_LDX && cls != BPF_ST && cls != BPF_STX) ||
+	    (type != PTR_TO_PACKET && type != PTR_TO_MAP_VALUE))
+		return 0;
+	if (insn->off < -2048 || insn->off > 2047)
+		return -EOPNOTSUPP;
+	return 0;
+}
+
 static int knod_bpf_verify_insn(struct bpf_verifier_env *env,
 				int insn_idx, int prev_insn)
 {
@@ -4109,7 +4225,9 @@ static int knod_bpf_verify_insn(struct bpf_verifier_env *env,
 	meta->sreg.reg = *sreg;
 	meta->dreg.reg = *dreg;
 
-	knod_bpf_update_ptr_off(knod_prog, meta, env);
+	err = knod_bpf_update_ptr_off(knod_prog, meta, env);
+	if (err)
+		goto out;
 
 	if (meta->insn.src_reg >= MAX_BPF_REG ||
 			meta->insn.dst_reg >= MAX_BPF_REG) {
@@ -4118,15 +4236,22 @@ static int knod_bpf_verify_insn(struct bpf_verifier_env *env,
 		goto out;
 	}
 
+	err = knod_bpf_check_global_offset(knod_prog->knod->isa_version,
+					  knod_bpf_jit_engine, &meta->insn,
+					  BPF_CLASS(meta->insn.code) == BPF_LDX ?
+					  sreg->type : dreg->type);
+	if (err)
+		goto out;
+
 	if (is_mbpf_load(meta)) {
 		err = knod_bpf_check_ptr(knod_prog, meta, env,
 					 meta->insn.src_reg);
 		goto out;
 	}
-	/* Immediate packet stores need the same pointer provenance as STX. */
+	/* Immediate stores need the same pointer provenance as STX. */
 	if (BPF_CLASS(meta->insn.code) == BPF_ST &&
 	    BPF_MODE(meta->insn.code) == BPF_MEM &&
-	    cur_regs(env)[meta->insn.dst_reg].type == PTR_TO_PACKET) {
+	    (dreg->type == PTR_TO_PACKET || dreg->type == PTR_TO_STACK)) {
 		err = knod_bpf_check_ptr(knod_prog, meta, env,
 					 meta->insn.dst_reg);
 		goto out;
@@ -4138,42 +4263,52 @@ static int knod_bpf_verify_insn(struct bpf_verifier_env *env,
 
 	if (is_mbpf_map_call(meta)) {
 		kreg = cur_regs(env) + 2;
-		meta->kreg.reg = *kreg;
-
-		prev_meta = knod_bpf_lookup_prev_meta_by_dreg(knod_prog,
-							      meta,
-							      2);
-		if (!prev_meta) {
-			knod_jit_dbg(" Invalid\n");
-			err = -EINVAL;
-			goto out;
-		}
-		if (base_type(kreg->type) == PTR_TO_PACKET)
-			meta->kreg.packet_off = prev_meta->dreg.packet_off;
-		else if (base_type(kreg->type) == PTR_TO_STACK)
-			meta->kreg.stack_off = prev_meta->dreg.stack_off;
-		if (knod_prog->max_stack_off > meta->kreg.stack_off)
-			knod_prog->max_stack_off = meta->kreg.stack_off;
-
-		/* bpf_map_update_elem: track r3 (value pointer) */
-		if (meta->insn.imm == 2) {
-			vreg = cur_regs(env) + 3;
-			meta->vreg.reg = *vreg;
-
+		if (kreg->type == PTR_TO_STACK) {
+			err = knod_bpf_native_stack_arg(&meta->kreg, kreg,
+						 env->cur_state->curframe);
+			if (err)
+				goto out;
+		} else {
+			if (meta->kreg.reg.type == PTR_TO_STACK) {
+				err = -EOPNOTSUPP;
+				goto out;
+			}
+			meta->kreg.reg = *kreg;
 			prev_meta = knod_bpf_lookup_prev_meta_by_dreg(knod_prog,
-								      meta,
-								      3);
+							      meta, 2);
 			if (!prev_meta) {
-				knod_jit_dbg(" Invalid vreg\n");
 				err = -EINVAL;
 				goto out;
 			}
-			if (base_type(vreg->type) == PTR_TO_PACKET)
-				meta->vreg.packet_off =
-					prev_meta->dreg.packet_off;
-			else if (base_type(vreg->type) == PTR_TO_STACK)
-				meta->vreg.stack_off =
-					prev_meta->dreg.stack_off;
+			if (base_type(kreg->type) == PTR_TO_PACKET)
+				meta->kreg.packet_off = prev_meta->dreg.packet_off;
+		}
+		if (knod_prog->max_stack_off > meta->kreg.stack_off)
+			knod_prog->max_stack_off = meta->kreg.stack_off;
+
+		/* bpf_map_update_elem: track r3 (value pointer). */
+		if (meta->insn.imm == 2) {
+			vreg = cur_regs(env) + 3;
+			if (vreg->type == PTR_TO_STACK) {
+				err = knod_bpf_native_stack_arg(&meta->vreg, vreg,
+							 env->cur_state->curframe);
+				if (err)
+					goto out;
+			} else {
+				if (meta->vreg.reg.type == PTR_TO_STACK) {
+					err = -EOPNOTSUPP;
+					goto out;
+				}
+				meta->vreg.reg = *vreg;
+				prev_meta = knod_bpf_lookup_prev_meta_by_dreg(knod_prog,
+								      meta, 3);
+				if (!prev_meta) {
+					err = -EINVAL;
+					goto out;
+				}
+				if (base_type(vreg->type) == PTR_TO_PACKET)
+					meta->vreg.packet_off = prev_meta->dreg.packet_off;
+			}
 			if (knod_prog->max_stack_off > meta->vreg.stack_off)
 				knod_prog->max_stack_off = meta->vreg.stack_off;
 		}
@@ -5299,18 +5434,104 @@ static u16 knod_bpf_lds_off(struct knod_bpf_priv *priv,
 	return (off - priv->lds_stack_base) * knod_bpf_workgroups;
 }
 
+
+
+
+
+static bool knod_bpf_lds_pair_offsets(struct knod_bpf_priv *priv, int off,
+				      u16 *off0, u16 *off1)
+{
+	u64 first, second;
+
+	if (priv->isa_version != 10 || !knod_bpf_workgroups ||
+	    knod_bpf_workgroups > KNOD_BPF_WORKGROUPS_MAX || (knod_bpf_workgroups & 63) ||
+	    priv->lds_stack_base < 0 || off < priv->lds_stack_base ||
+	    off > 504 || (off & 3))
+		return false;
+	first = (u64)(off - priv->lds_stack_base) * knod_bpf_workgroups;
+	second = first + 4 * knod_bpf_workgroups;
+	if ((first & 255) || (second & 255) || second > 65280 ||
+	    second + 4 * knod_bpf_workgroups > 65536)
+		return false;
+	*off0 = first >> 8;
+	*off1 = second >> 8;
+	return true;
+}
+
+static bool knod_bpf_issue_stack_words(struct knod_bpf_priv *priv,
+                                      struct knod_insn_meta *meta, int reg,
+                                      int arg, int len)
+{
+	const struct knod_bpf_reg_state *state;
+	struct amdgcn_param32 base, dst;
+	int off, i;
+
+	if (priv->isa_version != 10 || meta->jit_engine != 1 ||
+	    arg != 2 || reg != KEY_IN_PKT_64 ||
+	    len < 8 || len > 56 || (len & 3))
+		return false;
+	state = &meta->kreg;
+	if (state->reg.type != PTR_TO_STACK)
+		return false;
+	off = 512 + state->stack_off;
+	if (off < 0 || off > 512 - len || (off & 3) ||
+	    priv->lds_stack_base < 0 || off < priv->lds_stack_base ||
+	    !knod_bpf_workgroups || knod_bpf_workgroups > KNOD_BPF_WORKGROUPS_MAX ||
+	    (u64)(off + len - priv->lds_stack_base) *
+		knod_bpf_workgroups > 65536)
+		return false;
+	knod_vset32(&base, knod_bpf_lds_vreg(priv, KNOD_AMDGPU_LDS_BASE_VREG));
+	for (i = 0; i < len / 4; i++) {
+		u16 off0, off1;
+
+		dst = i & 1 ? r64[reg + i / 2].hi : r64[reg + i / 2].lo;
+		if (!(i & 1) && i + 1 < len / 4 &&
+		    r64[reg + i / 2].hi.v == dst.v + 1 &&
+		    knod_bpf_lds_pair_offsets(priv, off + i * 4, &off0, &off1)) {
+			knod_emit(priv, meta, ds_read2st64_b32, dst, base, off0, off1);
+			i++;
+			continue;
+		}
+		knod_emit(priv, meta, ds_read_b32, dst, base,
+			  knod_bpf_lds_off(priv, meta, off + i * 4));
+	}
+	return true;
+}
+
+static void knod_bpf_finish_stack_words(struct knod_bpf_priv *priv,
+                                        struct knod_insn_meta *meta, int reg, int len)
+{
+	struct amdgcn_param32 zero;
+
+	knod_emit(priv, meta, s_waitcnt_lgkmcnt);
+	if (len & 4) {
+		knod_iset32(&zero, 0);
+		knod_mov32(priv, meta, r64[reg + len / 8].hi, zero);
+	}
+}
+
+static bool knod_bpf_stage_stack_words(struct knod_bpf_priv *priv,
+                                      struct knod_insn_meta *meta, int reg,
+                                      int arg, int len)
+{
+	if (!knod_bpf_issue_stack_words(priv, meta, reg, arg, len))
+		return false;
+	knod_bpf_finish_stack_words(priv, meta, reg, len);
+	return true;
+}
+
 static struct amdgcn_param32 *knod_bpf_stack_win(struct knod_bpf_priv *priv,
 						 struct knod_insn_meta *meta,
 						 struct amdgcn_param32 *win,
 						 int off, bool load)
 {
-	knod_vset32(&win[0], KNOD_AMDGPU_STACK_WIN_VREG0);
-	knod_vset32(&win[1], KNOD_AMDGPU_STACK_WIN_VREG1);
+	knod_vset32(&win[0], knod_bpf_lds_vreg(priv, KNOD_AMDGPU_STACK_WIN_VREG0));
+	knod_vset32(&win[1], knod_bpf_lds_vreg(priv, KNOD_AMDGPU_STACK_WIN_VREG1));
 
 	if (load) {
 		struct amdgcn_param32 base;
 
-		knod_vset32(&base, KNOD_AMDGPU_LDS_BASE_VREG);
+		knod_vset32(&base, knod_bpf_lds_vreg(priv, KNOD_AMDGPU_LDS_BASE_VREG));
 		knod_emit(priv, meta, ds_read_b32, win[0], base,
 			  knod_bpf_lds_off(priv, meta, off & ~3));
 		knod_emit(priv, meta, ds_read_b32, win[1], base,
@@ -5327,7 +5548,7 @@ static void knod_bpf_stack_win_flush(struct knod_bpf_priv *priv,
 {
 	struct amdgcn_param32 base;
 
-	knod_vset32(&base, KNOD_AMDGPU_LDS_BASE_VREG);
+	knod_vset32(&base, knod_bpf_lds_vreg(priv, KNOD_AMDGPU_LDS_BASE_VREG));
 	knod_emit(priv, meta, ds_write_b32, base, win[0],
 		  knod_bpf_lds_off(priv, meta, off & ~3));
 	knod_emit(priv, meta, ds_write_b32, base, win[1],
@@ -5348,6 +5569,35 @@ static void knod_bpf_load_size32(struct knod_bpf_priv *priv,
 {
 	struct amdgcn_param32 win[2];
 
+	/* Subword slots are packed within each lane's dword. Odd halfwords
+	 * retain the existing reconstruction path; never cross into a lane.
+	 */
+	if (cache == stack && priv->isa_version == 10 &&
+	    (size == 1 || (size == 2 && !(off & 1)))) {
+		struct amdgcn_param32 base;
+		u16 addr = knod_bpf_lds_off(priv, meta, off & ~3) + (off & 3);
+
+		knod_vset32(&base, knod_bpf_lds_vreg(priv, KNOD_AMDGPU_LDS_BASE_VREG));
+		if (size == 1)
+			knod_emit(priv, meta, ds_read_u8, dst, base, addr);
+		else
+			knod_emit(priv, meta, ds_read_u16, dst, base, addr);
+		knod_emit(priv, meta, s_waitcnt_lgkmcnt);
+		return;
+	}
+
+	/* A complete aligned word needs neither a second LDS slot nor a
+	 * window copy. Keep the load completion boundary before its consumer.
+	 */
+	if (cache == stack && size == 4 && !(off & 3)) {
+		struct amdgcn_param32 base;
+
+		knod_vset32(&base, knod_bpf_lds_vreg(priv, KNOD_AMDGPU_LDS_BASE_VREG));
+		knod_emit(priv, meta, ds_read_b32, dst, base,
+			  knod_bpf_lds_off(priv, meta, off));
+		knod_emit(priv, meta, s_waitcnt_lgkmcnt);
+		return;
+	}
 	if (cache == stack)
 		cache = knod_bpf_stack_win(priv, meta, win, off, true);
 
@@ -5459,6 +5709,29 @@ static void knod_bpf_load_size(struct knod_bpf_priv *priv,
 	knod_jit_dbg(" %d: off = %d off_4 = %d size = %d\n", meta->bpf_insn_idx,
 		off, off%4, size);
 
+	if (cache == stack && size == 8 && !(off & 3)) {
+		struct amdgcn_param32 base;
+		u16 off0, off1;
+
+		/* Slot-major LDS: adjacent BPF words are WG*4 bytes apart,
+		 * not a contiguous ds_read_b64 address.
+		 */
+		knod_vset32(&base, knod_bpf_lds_vreg(priv, KNOD_AMDGPU_LDS_BASE_VREG));
+		if (dst->lo.type == AMDGCN_PARAM_TYPE_VGPR &&
+		    dst->hi.type == AMDGCN_PARAM_TYPE_VGPR &&
+		    dst->lo.v < 255 && dst->hi.v == dst->lo.v + 1 &&
+		    knod_bpf_lds_pair_offsets(priv, off, &off0, &off1)) {
+			knod_emit(priv, meta, ds_read2st64_b32, dst->lo, base,
+				  off0, off1);
+		} else {
+			knod_emit(priv, meta, ds_read_b32, dst->lo, base,
+				  knod_bpf_lds_off(priv, meta, off));
+			knod_emit(priv, meta, ds_read_b32, dst->hi, base,
+				  knod_bpf_lds_off(priv, meta, off + 4));
+		}
+		knod_emit(priv, meta, s_waitcnt_lgkmcnt);
+		return;
+	}
 	if (size == sizeof(unsigned long)) {
 		knod_bpf_load_size32(priv, meta, dst->lo, cache, 4, off);
 		knod_bpf_load_size32(priv, meta, dst->hi, cache, 4, off + 4);
@@ -5607,6 +5880,8 @@ static void knod_bpf_stage_arg(struct knod_bpf_priv *priv,
 {
 	int off = 0, n;
 
+	if (knod_bpf_stage_stack_words(priv, meta, reg, arg, len))
+		return;
 	while (len > 0) {
 		n = min(len, 8);
 		knod_bpf_load_arg(priv, meta, &r64[reg++], arg, off, n);
@@ -5677,6 +5952,141 @@ static bool knod_bpf_map_blob_kind(const struct knod_bpf_map_obj *obj,
  * the JIT puts around it is the arguments; how the map is searched and written
  * stops being its business, and the result is already in r0.
  */
+static bool knod_bpf_array_lookup_const(struct knod_bpf_priv *priv,
+				       struct knod_insn_meta *meta,
+				       struct knod_bpf_map *map,
+				       enum knod_blob_op op)
+{
+	const struct knod_bpf_map_obj *obj = map->knod_map_obj;
+	const struct knod_blob_map_desc *desc = map->desc;
+	struct amdgcn_param32 tmp, key, size, stride, carry, imm, wg;
+	struct amdgcn_param64 base, ret;
+	bool percpu;
+
+	if (priv->isa_version != 10 || op != KNOD_BLOB_OP_LOOKUP ||
+	    obj->key_size != 4 ||
+	    (obj->map_type != BPF_MAP_TYPE_ARRAY &&
+	     obj->map_type != BPF_MAP_TYPE_PERCPU_ARRAY))
+		return false;
+	if (obj->map_type == BPF_MAP_TYPE_PERCPU_ARRAY &&
+	    desc->per_instance_size > U32_MAX)
+		return false;
+	if (WARN_ON_ONCE(meta->blob))
+		return false;
+
+	percpu = obj->map_type == BPF_MAP_TYPE_PERCPU_ARRAY;
+	/* The descriptor already supplies immutable native address operands.
+	 * Fold only a proven in-range key; retain the existing path on overflow.
+	 * The BPF NULL branch and surrounding EXEC structure remain unchanged.
+	 */
+	if (meta->jit_engine == 1 && meta->array_key_proven &&
+	    meta->array_key_literal < desc->max_entries) {
+		u64 offset = (u64)meta->array_key_literal * desc->value_size;
+
+		if (offset <= U64_MAX - desc->elems_gaddr) {
+			u64 address = desc->elems_gaddr + offset;
+
+			knod_vset64(&ret, KNOD_BLOB_SPLICE_R0_VREG);
+			knod_iset32(&imm, (u32)address);
+			knod_mov32(priv, meta, ret.lo, imm);
+			knod_iset32(&imm, address >> 32);
+			knod_mov32(priv, meta, ret.hi, imm);
+			if (percpu) {
+				knod_vset32(&tmp, KNOD_BLOB_SPLICE_TMP_VREG + 2);
+				knod_sset32(&stride, KNOD_BLOB_SPLICE_TMP_SREG + 1);
+				knod_sset32(&carry, KNOD_BLOB_SPLICE_TMP_SREG + 2);
+				knod_sset32(&wg, KNOD_BLOB_PRO_WG_Y_SREG);
+				knod_iset32(&imm, desc->per_instance_size);
+				knod_emit(priv, meta, s_mov_b32, stride, imm);
+				knod_mov32(priv, meta, tmp, wg);
+				knod_emit(priv, meta, v_mad_u64_u32, ret, carry,
+					  stride, tmp, ret);
+			}
+			return true;
+		}
+	}
+	/* Only a CFG-proven literal replaces this private stack key read. */
+	if (meta->jit_engine == 1 && meta->array_key_proven) {
+		knod_vset32(&key, KNOD_BLOB_SPLICE_KEY_VREG);
+		knod_iset32(&imm, meta->array_key_literal);
+		knod_mov32(priv, meta, key, imm);
+		knod_vset32(&key, KNOD_BLOB_SPLICE_KEY_VREG + 1);
+		knod_iset32(&imm, 0);
+		knod_mov32(priv, meta, key, imm);
+	} else {
+		knod_bpf_stage_arg(priv, meta, KEY_IN_PKT_64, 2, obj->key_size);
+	}
+	knod_vset64(&base, KNOD_BLOB_SPLICE_TMP_VREG);
+	knod_vset64(&ret, KNOD_BLOB_SPLICE_R0_VREG);
+	knod_vset32(&tmp, KNOD_BLOB_SPLICE_TMP_VREG + 2);
+	knod_vset32(&key, KNOD_BLOB_SPLICE_KEY_VREG);
+	knod_sset32(&size, KNOD_BLOB_SPLICE_TMP_SREG);
+	knod_sset32(&stride, KNOD_BLOB_SPLICE_TMP_SREG + 1);
+	knod_sset32(&carry, KNOD_BLOB_SPLICE_TMP_SREG + 2);
+	knod_sset32(&wg, KNOD_BLOB_PRO_WG_Y_SREG);
+	knod_iset32(&imm, 0);
+	knod_mov32(priv, meta, ret.lo, imm);
+	knod_mov32(priv, meta, ret.hi, imm);
+	knod_iset32(&imm, desc->max_entries);
+	knod_mov32(priv, meta, tmp, imm);
+	knod_emit(priv, meta, v_cmp_ge_u32, key, tmp);
+	knod_emit(priv, meta, s_and_b64, KNOD_BLOB_EXEC_SAVE_SREG,
+		  AMDGCN_SREG_EXEC_LO, AMDGCN_SREG_VCC_LO);
+	knod_emit(priv, meta, s_andn2_b64, AMDGCN_SREG_EXEC_LO,
+		  AMDGCN_SREG_EXEC_LO, AMDGCN_SREG_VCC_LO);
+	/*
+	 * No memory access, election or loop follows. Empty EXEC is safe: SALU
+	 * only materializes constants; masked VALU does not touch inactive lanes.
+	 */
+	knod_iset32(&imm, (u32)desc->elems_gaddr);
+	knod_mov32(priv, meta, base.lo, imm);
+	knod_iset32(&imm, desc->elems_gaddr >> 32);
+	knod_mov32(priv, meta, base.hi, imm);
+	knod_iset32(&imm, desc->value_size);
+	knod_emit(priv, meta, s_mov_b32, size, imm);
+	if (percpu) {
+		knod_iset32(&imm, desc->per_instance_size);
+		knod_emit(priv, meta, s_mov_b32, stride, imm);
+		knod_mov32(priv, meta, tmp, wg);
+		knod_emit(priv, meta, v_mad_u64_u32, base, carry,
+			  stride, tmp, base);
+	}
+	knod_emit(priv, meta, v_mad_u64_u32, ret, carry, size, key, base);
+	knod_emit(priv, meta, s_or_b64, AMDGCN_SREG_EXEC_LO,
+		  AMDGCN_SREG_EXEC_LO, KNOD_BLOB_EXEC_SAVE_SREG);
+	return true;
+}
+
+static void knod_bpf_hash_preload(struct knod_bpf_priv *priv,
+				struct knod_insn_meta *meta,
+				const struct knod_blob_map_desc *desc)
+{
+	struct amdgcn_param32 dst, imm;
+	const u32 vreg[] = { KNOD_BLOB_HASH_PRE_ELEMS_VREG,
+			    KNOD_BLOB_HASH_PRE_ELEMS_VREG + 1,
+			    KNOD_BLOB_HASH_PRE_BUCKET_VREG,
+			    KNOD_BLOB_HASH_PRE_BUCKET_VREG + 1 };
+	const u32 value[] = { (u32)desc->elems_gaddr, desc->elems_gaddr >> 32,
+			     (u32)desc->bucket_gaddr, desc->bucket_gaddr >> 32 };
+	const u32 sreg[] = { KNOD_BLOB_HASH_PRE_SEED_SREG,
+			    KNOD_BLOB_HASH_PRE_MASK_SREG,
+			    KNOD_BLOB_HASH_PRE_STRIDE_SREG };
+	const u32 scalar[] = { desc->key_size + desc->hashrnd,
+			      desc->n_buckets - 1, desc->elem_size };
+	unsigned int i;
+
+	for (i = 0; i < ARRAY_SIZE(vreg); i++) {
+		knod_vset32(&dst, vreg[i]);
+		knod_iset32(&imm, value[i]);
+		knod_mov32(priv, meta, dst, imm);
+	}
+	for (i = 0; i < ARRAY_SIZE(sreg); i++) {
+		knod_sset32(&dst, sreg[i]);
+		knod_iset32(&imm, scalar[i]);
+		knod_emit(priv, meta, s_mov_b32, dst, imm);
+	}
+}
+
 static bool knod_bpf_map_op_blob(struct knod_bpf_priv *priv,
 				 struct knod_insn_meta *meta,
 				 struct knod_bpf_map *knod_map,
@@ -5686,6 +6096,7 @@ static bool knod_bpf_map_op_blob(struct knod_bpf_priv *priv,
 	struct amdgcn_param32 p32[2];
 	u32 kind, chunks, size;
 	const u32 *code;
+	bool preloaded = false, key_pending = false;
 
 	/* A meta holds one spliced routine, because it records one place to
 	 * put it.  One BPF call is one meta, so this should not come up.
@@ -5696,25 +6107,53 @@ static bool knod_bpf_map_op_blob(struct knod_bpf_priv *priv,
 	if (!knod_bpf_map_blob_kind(obj, op, &kind, &chunks))
 		return false;
 
-	code = knod_blob_find(&priv->blob, kind, chunks, &size);
+	/* Optional entry selection is transactional: absence retains the old ABI. */
+	code = NULL;
+	if ((priv->isa_version == 10 || priv->isa_version == 11) &&
+	    kind == KNOD_BLOB_LOOKUP_HASH && knod_map->desc->n_buckets &&
+	    is_power_of_2(knod_map->desc->n_buckets) &&
+	    knod_map->desc->elem_size) {
+		code = knod_blob_find(&priv->blob,
+				      KNOD_BLOB_LOOKUP_HASH_PRELOADED, chunks, &size);
+		preloaded = !!code;
+	}
+	if (!code)
+		code = knod_blob_find(&priv->blob, kind, chunks, &size);
 	if (!code) {
 		pr_warn_once("knod_bpf: blob has no %s for a %u-dword key; emitting it\n",
 			     knod_blob_kind_name(kind), chunks);
 		return false;
 	}
 
-	knod_bpf_stage_arg(priv, meta, KEY_IN_PKT_64, 2,
-			   obj->key_size);
+	/* Only this lookup owns an issued key until the descriptor MOVs finish.
+	 * No UPDATE argument or fallback caller receives an asynchronous key.
+	 */
+	if (priv->isa_version == 10 && meta->jit_engine == 1 &&
+	    preloaded &&
+	    op == KNOD_BLOB_OP_LOOKUP)
+		key_pending = knod_bpf_issue_stack_words(priv, meta,
+				KEY_IN_PKT_64, 2, obj->key_size);
+	if (!key_pending)
+		knod_bpf_stage_arg(priv, meta, KEY_IN_PKT_64, 2,
+				   obj->key_size);
 	if (op == KNOD_BLOB_OP_UPDATE)
 		knod_bpf_stage_arg(priv, meta, KEY_IN_MAP_64,
 				   3, obj->value_size);
 
-	knod_sset32(&p32[0], KNOD_BLOB_SPLICE_DESC_SREG);
-	knod_iset32(&p32[1], knod_map->desc_gaddr & ~0U);
-	knod_emit(priv, meta, s_mov_b32, p32[0], p32[1]);
-	knod_sset32(&p32[0], KNOD_BLOB_SPLICE_DESC_SREG + 1);
-	knod_iset32(&p32[1], knod_map->desc_gaddr >> 32);
-	knod_emit(priv, meta, s_mov_b32, p32[0], p32[1]);
+	if (preloaded) {
+		knod_bpf_hash_preload(priv, meta, knod_map->desc);
+	} else {
+		knod_sset32(&p32[0], KNOD_BLOB_SPLICE_DESC_SREG);
+		knod_iset32(&p32[1], knod_map->desc_gaddr & ~0U);
+		knod_emit(priv, meta, s_mov_b32, p32[0], p32[1]);
+		knod_sset32(&p32[0], KNOD_BLOB_SPLICE_DESC_SREG + 1);
+		knod_iset32(&p32[1], knod_map->desc_gaddr >> 32);
+		knod_emit(priv, meta, s_mov_b32, p32[0], p32[1]);
+	}
+
+	if (key_pending)
+		knod_bpf_finish_stack_words(priv, meta, KEY_IN_PKT_64,
+				    obj->key_size);
 
 	/* Scalar instructions are not masked, so a routine entered with no live
 	 * lane still runs - and one that elects a lane with mbcnt, or spins on
@@ -5749,6 +6188,8 @@ static bool knod_bpf_map_op(struct knod_bpf_priv *priv,
 		return false;
 	}
 
+	if (knod_bpf_array_lookup_const(priv, meta, knod_map, op))
+		return true;
 	return knod_bpf_map_op_blob(priv, meta, knod_map, op);
 }
 
@@ -5773,78 +6214,181 @@ static bool knod_bpf_map_op(struct knod_bpf_priv *priv,
  * worth on whichever element the lane that sent it had - which still sums to
  * the right total, and took a per-VIP breakdown to notice.
  */
-static void knod_bpf_emit_percpu_add(struct knod_bpf_priv *priv,
-				     struct knod_insn_meta *meta)
+static unsigned knod_bpf_atomic_forward_words(struct knod_insn_meta *meta, unsigned branch,
+					      unsigned end)
 {
-	struct amdgcn_param32 v_tmp, v_tmp_hi, v_zero, s_count, s_exec_lo,
-			      s_exec_hi;
+	unsigned i, words = 0;
+
+	for (i = branch + 1; i < end; i++)
+		words += meta->amdgpu_insn[i].size / 4;
+	return words;
+}
+
+static void knod_bpf_percpu_delta(struct knod_bpf_priv *priv, struct knod_insn_meta *meta,
+				  struct amdgcn_param64 delta)
+{
 	const struct knod_insn_meta *alu = meta->percpu_rmw_add;
-	bool is_dw = BPF_SIZE(meta->insn.code) == BPF_DW;
-	bool fold = meta->percpu_rmw_uniform;
-	int d = meta->insn.dst_reg;
+	bool dw = BPF_SIZE(meta->insn.code) == BPF_DW;
+	struct amdgcn_param32 imm;
 
-	knod_vset32(&v_tmp, KNOD_AMDGPU_TMP_VREG0_LO);
-	knod_vset32(&v_tmp_hi, KNOD_AMDGPU_TMP_VREG0_HI);
-	knod_sset32(&s_count, KNOD_AMDGPU_TMP_SREG0_LO);
-	knod_sset32(&s_exec_lo, AMDGCN_SREG_EXEC_LO);
-	knod_sset32(&s_exec_hi, AMDGCN_SREG_EXEC_LO + 1);
-	knod_iset32(&v_zero, 0);
-
-	if (meta->percpu_rmw_swapped) {
-		/* The add overwrote the register the amount was in, so take it
-		 * back off: what is there now is the amount plus what the map
-		 * held, and the map's value is still in the other register.
-		 */
-		knod_emit(priv, meta, v_sub_u32, v_tmp,
-			  bpf_reg64[alu->insn.dst_reg].lo,
-			  bpf_reg64[alu->insn.src_reg].lo);
+	if (meta->percpu_delta_direct) {
+		knod_mov32(priv, meta, delta.lo, bpf_reg64[alu->insn.dst_reg].lo);
+		knod_mov32(priv, meta, delta.hi, bpf_reg64[alu->insn.dst_reg].hi);
+	} else if (meta->percpu_rmw_swapped) {
+		if (dw)
+			knod_sub64(priv, meta, delta, bpf_reg64[alu->insn.dst_reg],
+				   bpf_reg64[alu->insn.src_reg]);
+		else
+			knod_sub32(priv, meta, delta.lo, bpf_reg64[alu->insn.dst_reg].lo,
+				   bpf_reg64[alu->insn.src_reg].lo);
 	} else if (BPF_SRC(alu->insn.code) == BPF_K) {
-		struct amdgcn_param32 v_imm;
-
-		knod_iset32(&v_imm, alu->insn.imm);
-		knod_emit(priv, meta, v_mov_b32_e32, v_tmp, v_imm);
+		knod_iset32(&imm, alu->insn.imm);
+		knod_mov32(priv, meta, delta.lo, imm);
+		if (dw) {
+			knod_iset32(&imm, alu->insn.imm < 0 ? ~0U : 0);
+			knod_mov32(priv, meta, delta.hi, imm);
+		}
 	} else {
-		knod_emit(priv, meta, v_mov_b32_e32, v_tmp,
-			  bpf_reg64[alu->insn.src_reg].lo);
+		knod_mov32(priv, meta, delta.lo, bpf_reg64[alu->insn.src_reg].lo);
+		if (dw)
+			knod_mov32(priv, meta, delta.hi, bpf_reg64[alu->insn.src_reg].hi);
 	}
+}
 
-	if (fold) {
-		/* Every lane is adding v_tmp to the same place, so the wave's
-		 * total is that times how many of them there are, and the
-		 * first of them carries it.
-		 */
-		knod_emit(priv, meta, s_bcnt1_i32_b64,
-			  KNOD_AMDGPU_TMP_SREG0_LO, AMDGCN_SREG_EXEC_LO);
-		knod_emit(priv, meta, v_mul_lo_u32, v_tmp, s_count, v_tmp);
-		knod_emit(priv, meta, v_mbcnt_lo_u32_b32, v_tmp_hi, s_exec_lo,
-			  v_zero);
-		knod_emit(priv, meta, v_mbcnt_hi_u32_b32, v_tmp_hi, s_exec_hi,
-			  v_tmp_hi);
-		knod_emit(priv, meta, v_cmp_eq_u32, v_zero, v_tmp_hi);
-		/* The count is spent, so the pair it sat in holds the mask. */
-		knod_emit(priv, meta, s_and_saveexec_b64,
-			  KNOD_AMDGPU_TMP_SREG0_LO, AMDGCN_SREG_VCC_LO);
-	}
+static void knod_bpf_percpu_atomic(struct knod_bpf_priv *priv, struct knod_insn_meta *meta,
+				   struct amdgcn_param64 delta)
+{
+	if (BPF_SIZE(meta->insn.code) == BPF_DW)
+		knod_emit(priv, meta, global_atomic_add_x2, delta.lo,
+			  bpf_reg64[meta->insn.dst_reg].lo, delta.lo, meta->insn.off, 0);
+	else
+		knod_emit(priv, meta, global_atomic_add, delta.lo, bpf_reg64[meta->insn.dst_reg].lo,
+			  delta.lo, meta->insn.off, 0);
+}
 
-	if (is_dw) {
-		struct amdgcn_param32 v_31;
+static void knod_bpf_percpu_fold(struct knod_bpf_priv *priv, struct knod_insn_meta *meta,
+				 struct amdgcn_param64 delta, bool one)
+{
+	struct amdgcn_param32 count, lane, high, zero, exec_lo, exec_hi;
 
-		/* The pair the x2 atomic adds is one number, low half first,
-		 * so a 32-bit amount goes in the low one and its sign in the
-		 * high one.
-		 */
-		knod_iset32(&v_31, 31);
-		knod_emit(priv, meta, v_ashrrev_i32, v_tmp_hi, v_31, v_tmp);
-		knod_emit(priv, meta, global_atomic_add_x2, v_tmp,
-			  bpf_reg64[d].lo, v_tmp, meta->insn.off, 0);
+	knod_sset32(&count, KNOD_AMDGPU_TMP_SREG0_LO);
+	knod_sset32(&exec_lo, AMDGCN_SREG_EXEC_LO);
+	knod_sset32(&exec_hi, AMDGCN_SREG_EXEC_LO + 1);
+	knod_vset32(&lane, KNOD_AMDGPU_TMP_VREG1_LO);
+	knod_vset32(&high, KNOD_AMDGPU_TMP_VREG1_HI);
+	knod_iset32(&zero, 0);
+	knod_emit(priv, meta, s_bcnt1_i32_b64, KNOD_AMDGPU_TMP_SREG0_LO, AMDGCN_SREG_EXEC_LO);
+	if (one) {
+		knod_mov32(priv, meta, delta.lo, count);
+		knod_mov32(priv, meta, delta.hi, zero);
 	} else {
-		knod_emit(priv, meta, global_atomic_add, v_tmp,
-			  bpf_reg64[d].lo, v_tmp, meta->insn.off, 0);
+		if (BPF_SIZE(meta->insn.code) == BPF_DW) {
+			knod_emit(priv, meta, v_mul_hi_u32, high, count, delta.lo);
+			knod_emit(priv, meta, v_mul_lo_u32, delta.hi, count, delta.hi);
+			knod_emit(priv, meta, v_add_u32, delta.hi, delta.hi, high);
+		}
+		knod_emit(priv, meta, v_mul_lo_u32, delta.lo, count, delta.lo);
+	}
+	knod_emit(priv, meta, v_mbcnt_lo_u32_b32, lane, exec_lo, zero);
+	if (64 == 64)
+		knod_emit(priv, meta, v_mbcnt_hi_u32_b32, lane, exec_hi, lane);
+	knod_emit(priv, meta, v_cmp_eq_u32, zero, lane);
+	knod_emit(priv, meta, s_and_saveexec_b64, KNOD_AMDGPU_TMP_SREG0_LO, AMDGCN_SREG_VCC_LO);
+	knod_bpf_percpu_atomic(priv, meta, delta);
+	knod_emit(priv, meta, s_mov_b64, AMDGCN_SREG_EXEC_LO, KNOD_AMDGPU_TMP_SREG0_LO);
+}
+
+static void knod_bpf_emit_percpu_add(struct knod_bpf_priv *priv, struct knod_insn_meta *meta)
+{
+	struct amdgcn_param64 delta, first;
+	struct amdgcn_param32 scalar;
+	unsigned empty, address_diff = 0, different = 0, done, fallback, end;
+	bool immediate = BPF_SRC(meta->percpu_rmw_add->insn.code) == BPF_K;
+
+	knod_vset64(&delta, KNOD_AMDGPU_TMP_VREG0_LO);
+	/* The address proof applies to the current EXEC at either width;
+	 * a constant +1 needs only its active-lane count as the full-width delta.
+	 */
+	if (priv->isa_version == 10 && meta->jit_engine == 1 &&
+	    meta->percpu_rmw_uniform && meta->percpu_addr_proven &&
+	    !meta->percpu_rmw_swapped && !meta->percpu_delta_direct &&
+	    BPF_SIZE(meta->insn.code) == BPF_DW &&
+	    meta->percpu_rmw_add->insn.code == (BPF_ALU64 | BPF_ADD | BPF_K) &&
+	    meta->percpu_rmw_add->insn.imm == 1) {
+		empty = meta->amdgpu_insns;
+		knod_emit(priv, meta, s_cbranch_execz, 0);
+		knod_bpf_percpu_fold(priv, meta, delta, true);
+		emit_s_cbranch_execz(priv->isa_version, &meta->amdgpu_insn[empty],
+				     knod_bpf_atomic_forward_words(meta, empty,
+							   meta->amdgpu_insns));
+		return;
+	}
+	knod_bpf_percpu_delta(priv, meta, delta);
+	if (!meta->percpu_rmw_uniform) {
+		knod_bpf_percpu_atomic(priv, meta, delta);
+		return;
+	}
+	if (priv->isa_version != 10) {
+		knod_bpf_percpu_atomic(priv, meta, delta);
+		return;
 	}
 
-	if (fold)
-		knod_emit(priv, meta, s_mov_b64, AMDGCN_SREG_EXEC_LO,
-			  KNOD_AMDGPU_TMP_SREG0_LO);
+	/* readfirstlane requires a live lane. Do not change EXEC for the test;
+	 * any differing active amount selects the unchanged per-lane path.
+	 */
+	empty = meta->amdgpu_insns;
+	knod_emit(priv, meta, s_cbranch_execz, 0);
+	knod_vset64(&first, KNOD_AMDGPU_TMP_VREG1_LO);
+	knod_sset32(&scalar, KNOD_BLOB_SPLICE_TMP_SREG);
+	if (!meta->percpu_addr_proven) {
+		/* The verifier-era uniform flag is only a hint. Prove the actual
+		 * complete address at runtime, including conditional constant keys.
+		 */
+		knod_emit(priv, meta, v_readfirstlane_b32, KNOD_BLOB_SPLICE_TMP_SREG,
+			  bpf_reg64[meta->insn.dst_reg].lo.v);
+		knod_mov32(priv, meta, first.lo, scalar);
+		knod_emit(priv, meta, v_readfirstlane_b32, KNOD_BLOB_SPLICE_TMP_SREG,
+			  bpf_reg64[meta->insn.dst_reg].hi.v);
+		knod_mov32(priv, meta, first.hi, scalar);
+		knod_emit(priv, meta, v_cmp_eq_u64, bpf_reg64[meta->insn.dst_reg].lo, first.lo);
+		knod_emit(priv, meta, s_andn2_b64, AMDGCN_SREG_VCC_LO, AMDGCN_SREG_EXEC_LO,
+			  AMDGCN_SREG_VCC_LO);
+		address_diff = meta->amdgpu_insns;
+		knod_emit(priv, meta, s_cbranch_vccnz, 0);
+	}
+	if (!immediate) {
+		knod_emit(priv, meta, v_readfirstlane_b32, KNOD_BLOB_SPLICE_TMP_SREG,
+			  KNOD_AMDGPU_TMP_VREG0_LO);
+		knod_mov32(priv, meta, first.lo, scalar);
+		if (BPF_SIZE(meta->insn.code) == BPF_DW) {
+			knod_emit(priv, meta, v_readfirstlane_b32, KNOD_BLOB_SPLICE_TMP_SREG,
+				  KNOD_AMDGPU_TMP_VREG0_HI);
+			knod_mov32(priv, meta, first.hi, scalar);
+			knod_emit(priv, meta, v_cmp_eq_u64, delta.lo, first.lo);
+		} else {
+			knod_emit(priv, meta, v_cmp_eq_u32, delta.lo, first.lo);
+		}
+		knod_emit(priv, meta, s_andn2_b64, AMDGCN_SREG_VCC_LO, AMDGCN_SREG_EXEC_LO,
+			  AMDGCN_SREG_VCC_LO);
+		different = meta->amdgpu_insns;
+		knod_emit(priv, meta, s_cbranch_vccnz, 0);
+	}
+	knod_bpf_percpu_fold(priv, meta, delta, false);
+	done = meta->amdgpu_insns;
+	knod_emit(priv, meta, s_branch, 0);
+	fallback = meta->amdgpu_insns;
+	knod_bpf_percpu_atomic(priv, meta, delta);
+	end = meta->amdgpu_insns;
+	emit_s_cbranch_execz(priv->isa_version, &meta->amdgpu_insn[empty],
+			     knod_bpf_atomic_forward_words(meta, empty, end));
+	if (!meta->percpu_addr_proven)
+		emit_s_cbranch_vccnz(priv->isa_version, &meta->amdgpu_insn[address_diff],
+				    knod_bpf_atomic_forward_words(meta, address_diff, fallback));
+	if (!immediate)
+		emit_s_cbranch_vccnz(priv->isa_version, &meta->amdgpu_insn[different],
+				    knod_bpf_atomic_forward_words(meta, different, fallback));
+	emit_s_branch(priv->isa_version, &meta->amdgpu_insn[done],
+		      knod_bpf_atomic_forward_words(meta, done, end));
 }
 
 static void __knod_bpf_store_cache_size(struct knod_bpf_priv *priv,
@@ -5863,6 +6407,53 @@ static void knod_bpf_store_cache_size(struct knod_bpf_priv *priv,
 
 	if (cache != stack) {
 		__knod_bpf_store_cache_size(priv, meta, src, cache, size, off);
+		return;
+	}
+
+	if (priv->isa_version == 10 &&
+	    (size == 1 || (size == 2 && !(off & 1)))) {
+		struct amdgcn_param32 base;
+		u16 addr = knod_bpf_lds_off(priv, meta, off & ~3) + (off & 3);
+
+		knod_vset32(&base, knod_bpf_lds_vreg(priv, KNOD_AMDGPU_LDS_BASE_VREG));
+		knod_vset32(&win[0], knod_bpf_lds_vreg(priv, KNOD_AMDGPU_STACK_WIN_VREG0));
+		knod_mov32(priv, meta, win[0], src->lo);
+		if (size == 1)
+			knod_emit(priv, meta, ds_write_b8, base, win[0], addr);
+		else
+			knod_emit(priv, meta, ds_write_b16, base, win[0], addr);
+		return;
+	}
+
+	if (!(off & 3) && (size == 4 || size == 8)) {
+		struct amdgcn_param32 base;
+		u16 off0, off1;
+
+		/* Native LDS reads finish before returning. Ordinary GFX10
+		 * LDS writes do not retain their source VGPRs until completion.
+		 * Keep the established wait contract for other generations.
+		 */
+		if (priv->isa_version != 10)
+			knod_emit(priv, meta, s_waitcnt_lgkmcnt);
+		knod_vset32(&base, knod_bpf_lds_vreg(priv, KNOD_AMDGPU_LDS_BASE_VREG));
+		knod_vset32(&win[0], knod_bpf_lds_vreg(priv, KNOD_AMDGPU_STACK_WIN_VREG0));
+		knod_vset32(&win[1], knod_bpf_lds_vreg(priv, KNOD_AMDGPU_STACK_WIN_VREG1));
+		knod_mov32(priv, meta, win[0], src->lo);
+		if (size == 8)
+			knod_mov32(priv, meta, win[1], src->hi);
+		if (size == 8 &&
+		    knod_bpf_lds_pair_offsets(priv, off, &off0, &off1)) {
+			knod_emit(priv, meta, ds_write2st64_b32, base,
+				  win[0], win[1], off0, off1);
+		} else {
+			knod_emit(priv, meta, ds_write_b32, base, win[0],
+				  knod_bpf_lds_off(priv, meta, off));
+			if (size == 8)
+				knod_emit(priv, meta, ds_write_b32, base, win[1],
+					  knod_bpf_lds_off(priv, meta, off + 4));
+		}
+		if (priv->isa_version != 10)
+			knod_emit(priv, meta, s_waitcnt_lgkmcnt);
 		return;
 	}
 
@@ -6977,6 +7568,3765 @@ static int knod_bpf_emit_epilogue(struct knod_bpf_priv *priv,
 	return 0;
 }
 
+/* A bounded straight-line suffix is enough to prove a copy's final temporary
+ * dead. Unknown successors/CFG/EXEC boundaries start all-live; an ordinary
+ * overwrite before that boundary can still kill the old value. EXIT needs
+ * only R0. This deliberately does not solve inter-block fixed points. */
+static unsigned short knod_bpf_live_after_group(struct knod_prog *prog,
+						struct knod_insn_meta *first, unsigned int count)
+{
+	struct knod_insn_meta *window[64], *meta = first, *next;
+	unsigned short live = KNOD_BPF_REGS_LIVE;
+	unsigned int n = 0, i;
+
+	for (i = 1; i < count; i++) {
+		if (list_is_last(&meta->l, &prog->insns))
+			return live;
+		meta = list_next_entry(meta, l);
+	}
+	while (n < ARRAY_SIZE(window) && !list_is_last(&meta->l, &prog->insns)) {
+		struct knod_bpf_effect f;
+
+		next = list_next_entry(meta, l);
+		if (next->is_merge_point || (next->flags & FLAG_INSN_IS_JUMP_DST) ||
+		    next->subprog_idx != first->subprog_idx || next->bpf_insn_idx < 0 ||
+		    next->bpf_insn_idx != meta->bpf_insn_idx + 1)
+			break;
+		window[n++] = next;
+		f = knod_bpf_effect(&next->insn);
+		if (f.barrier || f.terminal)
+			break;
+		meta = next;
+	}
+	while (n)
+		live = knod_bpf_live_before(&window[--n]->insn, live);
+	return live;
+}
+/* The existing per-CPU rewrite consumes the increment, not the old load.
+ * Drop an adjacent dead +1 or distinct-register ADD. Keep the atomic and all live
+ * BPF values; uncertain successors remain all-live in the bounded proof.
+ */
+static bool knod_bpf_percpu_dead_owned(struct knod_insn_meta *m)
+{
+	return m->wide_read.owned || m->map_widen.owned || m->read_batch.owned || m->load_pair.owned || m->memory_group_owned || m->loads.count || m->copy.bytes ||
+		m->store.bytes || m->packet_region.count || m->conststore.bytes ||
+		m->conststore.elide || m->store_hoist.emit ||
+		m->store_hoist.elide || m->sink.member;
+}
+
+/* Incoming EXEC edges retain their own values; only outgoing barriers
+ * stop this current-lane dead-result proof. */
+static bool knod_bpf_percpu_result_dead(struct knod_prog *prog,
+				      struct knod_insn_meta *store, int reg)
+{
+	struct knod_insn_meta *m = store, *next;
+	unsigned int n;
+
+	for (n = 0; n < 64 && !list_is_last(&m->l, &prog->insns); n++) {
+		struct knod_bpf_effect f;
+
+		next = list_next_entry(m, l);
+		if (next->subprog_idx != store->subprog_idx ||
+		    next->bpf_insn_idx < 0 ||
+		    next->bpf_insn_idx != m->bpf_insn_idx + 1)
+			return false;
+		f = knod_bpf_effect(&next->insn);
+		if (f.barrier || (f.uses & (1U << reg)))
+			return false;
+		if (f.terminal || (f.defs & (1U << reg)))
+			return true;
+		m = next;
+	}
+	return false;
+}
+
+static noinline bool knod_bpf_forward_dead(struct knod_prog *prog,
+				 struct knod_insn_meta *store, int reg);
+
+static void knod_bpf_analyze_percpu_dead(struct knod_bpf_priv *priv,
+				       struct knod_prog *prog)
+{
+	struct knod_insn_meta *load, *alu, *store, *prep;
+	int r;
+
+	list_for_each_entry(load, &prog->insns, l)
+		load->percpu_dead = false;
+	if (priv->isa_version != 10 && priv->isa_version != 11)
+		return;
+	list_for_each_entry(load, &prog->insns, l) {
+		if (load->insn.code != (BPF_LDX | BPF_MEM | BPF_DW) ||
+		    load->ptr.type != PTR_TO_MAP_VALUE ||
+		    load->bpf_insn_idx < 0 ||
+		    list_is_last(&load->l, &prog->insns))
+			continue;
+		alu = list_next_entry(load, l);
+		prep = NULL;
+		/* Preserve this exact private LDS read and its completed result.
+		 * It prepares the distinct ADD source, never the map address. */
+		if (alu->insn.code == (BPF_LDX | BPF_MEM | BPF_DW) &&
+		    alu->ptr.type == PTR_TO_STACK && alu->insn.src_reg == 10 &&
+		    alu->insn.dst_reg <= 9 &&
+		    alu->insn.dst_reg != load->insn.dst_reg &&
+		    alu->insn.dst_reg != load->insn.src_reg &&
+		    !((alu->sreg.stack_off + alu->insn.off) & 3) &&
+		    !alu->is_merge_point && !(alu->flags & FLAG_INSN_IS_JUMP_DST) &&
+		    alu->subprog_idx == load->subprog_idx &&
+		    alu->bpf_insn_idx == load->bpf_insn_idx + 1 &&
+		    !knod_bpf_percpu_dead_owned(alu) &&
+		    !list_is_last(&alu->l, &prog->insns)) {
+			prep = alu;
+			alu = list_next_entry(alu, l);
+		}
+		if (list_is_last(&alu->l, &prog->insns))
+			continue;
+		store = list_next_entry(alu, l);
+		r = load->insn.dst_reg;
+		if (r > 9 || r == load->insn.src_reg ||
+		    !((alu->insn.code == (BPF_ALU64 | BPF_ADD | BPF_K) &&
+		       alu->insn.imm == 1) ||
+		      (alu->insn.code == (BPF_ALU64 | BPF_ADD | BPF_X) &&
+		       alu->insn.src_reg <= 9 && alu->insn.src_reg != r)) ||
+		    alu->insn.dst_reg != r ||
+		    store->insn.code != (BPF_STX | BPF_MEM | BPF_DW) ||
+		    store->insn.src_reg != r ||
+		    store->insn.dst_reg != load->insn.src_reg ||
+		    store->insn.off != load->insn.off ||
+		    store->percpu_rmw_add != alu || store->percpu_rmw_swapped ||
+		    alu->bpf_insn_idx != load->bpf_insn_idx + 1 + !!prep ||
+		    (prep && (alu->insn.code != (BPF_ALU64 | BPF_ADD | BPF_X) ||
+			      alu->insn.src_reg != prep->insn.dst_reg)) ||
+		    store->bpf_insn_idx != alu->bpf_insn_idx + 1 ||
+		    alu->subprog_idx != load->subprog_idx ||
+		    store->subprog_idx != load->subprog_idx ||
+		    alu->is_merge_point || store->is_merge_point ||
+		    ((alu->flags | store->flags) & FLAG_INSN_IS_JUMP_DST) ||
+		    knod_bpf_percpu_dead_owned(load) ||
+		    knod_bpf_percpu_dead_owned(alu) ||
+		    knod_bpf_percpu_dead_owned(store) ||
+		    !(knod_bpf_percpu_result_dead(prog, store, r) ||
+		      (priv->isa_version == 10 && prog->jit_engine == 1 &&
+		       true &&
+		       knod_bpf_forward_dead(prog, store, r))))
+			continue;
+		load->percpu_dead = true;
+		alu->percpu_dead = true;
+	}
+}
+
+/* Original BPF indices are stable across native RPO ordering. */
+static struct knod_insn_meta *knod_bpf_unique_index(struct knod_prog *prog,
+                                                  int index, int subprog)
+{
+	struct knod_insn_meta *m, *found = NULL;
+
+	list_for_each_entry(m, &prog->insns, l) {
+		if (m->bpf_insn_idx != index)
+			continue;
+		if (found || m->subprog_idx != subprog)
+			return NULL;
+		found = m;
+	}
+	return found;
+}
+
+/* Only definitions retained by the selected native lowering kill a value. */
+static bool knod_bpf_retained_definition(struct knod_insn_meta *m)
+{
+	if (m->percpu_dead || m->sr.owner || m->map_lds_head ||
+	    m->map_lds_tail || m->map_region.region || m->map_region.producer)
+		return false;
+	/* A selected wide-read projection writes this original destination. */
+	if (m->wide_read.owned)
+		return m->wide_read.load && BPF_CLASS(m->insn.code) == BPF_LDX &&
+			BPF_MODE(m->insn.code) == BPF_MEM && !m->map_widen.owned &&
+			!m->read_batch.owned && !m->load_pair.owned &&
+			!m->memory_group_owned && !m->loads.count &&
+			!m->copy.bytes && !m->store.bytes && !m->packet_region.count &&
+			!m->conststore.bytes && !m->conststore.elide &&
+			!m->store_hoist.emit && !m->store_hoist.elide && !m->sink.member;
+	return !knod_bpf_percpu_dead_owned(m);
+}
+
+/* All forward successors must kill the old register before observing it.
+ * Unknown instructions, calls, cycles and a bounded-work overflow fall back.
+ */
+static noinline bool knod_bpf_forward_dead(struct knod_prog *prog,
+                                 struct knod_insn_meta *store, int reg)
+{
+	int pending[128], seen[64], nr = 1, count = 0, i;
+
+	if (store->bpf_insn_idx < 0 || store->bpf_insn_idx > INT_MAX - 32769)
+		return false;
+	pending[0] = store->bpf_insn_idx + 1;
+	while (nr) {
+		struct knod_insn_meta *m, *high;
+		struct knod_bpf_effect effect;
+		int index = pending[--nr], next;
+		unsigned int cls, op;
+
+		for (i = 0; i < count; i++)
+			if (seen[i] == index)
+				break;
+		if (i < count)
+			continue;
+		if (count == ARRAY_SIZE(seen))
+			return false;
+		seen[count++] = index;
+		m = knod_bpf_unique_index(prog, index, store->subprog_idx);
+		if (!m || index <= store->bpf_insn_idx || index > INT_MAX - 32769 ||
+		    (m->flags & FLAG_INSN_IS_SUBPROG_START))
+			return false;
+		next = index + 1;
+		cls = BPF_CLASS(m->insn.code);
+		op = BPF_OP(m->insn.code);
+		if (cls == BPF_JMP || cls == BPF_JMP32) {
+			if (m->insn.code == (BPF_JMP | BPF_EXIT)) {
+				if (!reg)
+					return false;
+				continue;
+			}
+			if (op == BPF_CALL || m->insn.off < 0 ||
+			    (cls == BPF_JMP32 && op == BPF_JA))
+				return false;
+			switch (op) {
+			case BPF_JA: break;
+			case BPF_JEQ: case BPF_JNE: case BPF_JGT: case BPF_JGE:
+			case BPF_JLT: case BPF_JLE: case BPF_JSET:
+			case BPF_JSGT: case BPF_JSGE: case BPF_JSLT: case BPF_JSLE:
+				if (m->insn.dst_reg == reg ||
+				    (BPF_SRC(m->insn.code) == BPF_X && m->insn.src_reg == reg))
+					return false;
+				if (nr >= ARRAY_SIZE(pending))
+					return false;
+				pending[nr++] = next;
+				break;
+			default: return false;
+			}
+			next += m->insn.off;
+		} else {
+			effect = knod_bpf_effect(&m->insn);
+			if (effect.barrier || (effect.uses & (1U << reg)))
+				return false;
+			if (m->insn.code == (BPF_LD | BPF_IMM | BPF_DW)) {
+				high = knod_bpf_unique_index(prog, next, store->subprog_idx);
+				if (!high || high->insn.code || high->insn.dst_reg ||
+				    high->insn.src_reg || high->insn.off ||
+				    high->is_merge_point || (high->flags & FLAG_INSN_IS_JUMP_DST))
+					return false;
+				next++;
+			}
+			if (effect.defs & (1U << reg)) {
+				if (!knod_bpf_retained_definition(m))
+					return false;
+				continue;
+			}
+		}
+		if (nr >= ARRAY_SIZE(pending))
+			return false;
+		pending[nr++] = next;
+	}
+	return true;
+}
+
+static bool knod_bpf_swapped_owned(struct knod_insn_meta *m)
+{
+	return knod_bpf_percpu_dead_owned(m) || m->percpu_dead || m->sr.owner ||
+		m->map_lds_head || m->map_lds_tail ||
+		m->map_region.region || m->map_region.producer;
+}
+
+static void knod_bpf_analyze_swapped_dead(struct knod_bpf_priv *priv,
+                                         struct knod_prog *prog)
+{
+	struct knod_insn_meta *load, *alu, *store;
+
+	list_for_each_entry(store, &prog->insns, l)
+		store->percpu_delta_direct = false;
+	if (priv->isa_version != 10 || prog->jit_engine != 1)
+		return;
+	list_for_each_entry(load, &prog->insns, l) {
+		if (load->insn.code != (BPF_LDX | BPF_MEM | BPF_DW) ||
+		    load->ptr.type != PTR_TO_MAP_VALUE || load->insn.dst_reg > 9 ||
+		    load->insn.src_reg > 9 || load->insn.dst_reg == load->insn.src_reg ||
+		    load->bpf_insn_idx < 0 || load->bpf_insn_idx > INT_MAX - 32771 ||
+		    list_is_last(&load->l, &prog->insns))
+			continue;
+		alu = list_next_entry(load, l);
+		if (list_is_last(&alu->l, &prog->insns))
+			continue;
+		store = list_next_entry(alu, l);
+		if (alu->insn.code != (BPF_ALU64 | BPF_ADD | BPF_X) ||
+		    alu->insn.src_reg != load->insn.dst_reg || alu->insn.dst_reg > 9 ||
+		    alu->insn.dst_reg == alu->insn.src_reg ||
+		    alu->insn.dst_reg == load->insn.src_reg ||
+		    store->insn.code != (BPF_STX | BPF_MEM | BPF_DW) ||
+		    store->insn.src_reg != alu->insn.dst_reg ||
+		    store->insn.dst_reg != load->insn.src_reg ||
+		    store->insn.off != load->insn.off ||
+		    !store->percpu_rmw_swapped || store->percpu_rmw_add != alu ||
+		    alu->bpf_insn_idx != load->bpf_insn_idx + 1 ||
+		    store->bpf_insn_idx != alu->bpf_insn_idx + 1 ||
+		    alu->subprog_idx != load->subprog_idx || store->subprog_idx != load->subprog_idx ||
+		    alu->is_merge_point || store->is_merge_point ||
+		    ((alu->flags | store->flags) & (FLAG_INSN_IS_JUMP_DST | FLAG_INSN_IS_SUBPROG_START)) ||
+		    knod_bpf_swapped_owned(load) || knod_bpf_swapped_owned(alu) || knod_bpf_swapped_owned(store) ||
+		    !knod_bpf_forward_dead(prog, store, load->insn.dst_reg) ||
+		    !knod_bpf_forward_dead(prog, store, alu->insn.dst_reg))
+			continue;
+		load->percpu_dead = true;
+		alu->percpu_dead = true;
+		store->percpu_delta_direct = true;
+	}
+}
+
+/* A retained AND with a nonnegative immediate clears the upper dword.
+ * Keep this local to equality predicates: no arithmetic range inference.
+ */
+static bool knod_bpf_emit_known_zero_cmp(struct knod_bpf_priv *priv,
+					 struct knod_prog *prog,
+					 struct knod_insn_meta *meta)
+{
+	struct knod_insn_meta *prev;
+	struct amdgcn_param32 value, imm;
+
+	if (priv->isa_version != 10 || meta->jit_engine != 1 ||
+	    (meta->insn.code != (BPF_JMP | BPF_JEQ | BPF_K) &&
+	     meta->insn.code != (BPF_JMP | BPF_JNE | BPF_K)) ||
+	    meta->insn.imm < 0 || meta->insn.imm > 64 ||
+	    meta->insn.dst_reg > 9 || meta->bpf_insn_idx <= 0 ||
+	    meta->is_merge_point ||
+	    (meta->flags & (FLAG_INSN_IS_JUMP_DST | FLAG_INSN_IS_SUBPROG_START)) ||
+	    knod_bpf_swapped_owned(meta) || list_is_first(&meta->l, &prog->insns))
+		return false;
+	prev = list_prev_entry(meta, l);
+	if (prev->bpf_insn_idx != meta->bpf_insn_idx - 1 ||
+	    prev->subprog_idx != meta->subprog_idx ||
+	    prev->insn.code != (BPF_ALU64 | BPF_AND | BPF_K) ||
+	    prev->insn.dst_reg != meta->insn.dst_reg || prev->insn.imm < 0 ||
+	    prev->dreg.reg.type != SCALAR_VALUE ||
+	    prev->is_merge_point ||
+	    (prev->flags & (FLAG_INSN_IS_JUMP_DST | FLAG_INSN_IS_SUBPROG_START)) ||
+	    knod_bpf_swapped_owned(prev))
+		return false;
+	knod_iset32(&imm, meta->insn.imm);
+	knod_vset32(&value, meta->insn.dst_reg * 2);
+	knod_emit(priv, meta, v_cmp_eq_u32, imm, value);
+	return true;
+}
+
+/* Analyze the final emission order, after CFG restructuring. Interior jump
+ * targets and EXEC merges terminate a group, including synthetic boundaries.
+ * The unchanged common base proves aliasing from offsets alone. Packet
+ * ownership excludes concurrent writers; shared map values are not eligible.
+ */
+static void knod_bpf_analyze_copy(struct knod_prog *prog,
+				  struct knod_insn_meta *first)
+{
+	struct knod_insn_meta *ld = first, *st;
+	int offsets[16], lo = SHRT_MAX, hi = SHRT_MIN;
+	int base = first->insn.src_reg, tmp = first->insn.dst_reg;
+	int delta = 0, best = 0, start = 0, last = 0;
+	int i, j;
+
+	if (first->insn.code != (BPF_LDX | BPF_MEM | BPF_B) ||
+	    first->ptr.type != PTR_TO_PACKET || tmp == base)
+		return;
+
+	for (i = 0; i < ARRAY_SIZE(offsets); i++) {
+		if (ld->insn.code != (BPF_LDX | BPF_MEM | BPF_B) ||
+		    ld->ptr.type != PTR_TO_PACKET ||
+		    ld->subprog_idx != first->subprog_idx ||
+		    ld->insn.src_reg != base || ld->insn.dst_reg != tmp ||
+		    ld->bpf_insn_idx != first->bpf_insn_idx + 2 * i ||
+		    (i && (ld->is_merge_point ||
+			   (ld->flags & FLAG_INSN_IS_JUMP_DST))) ||
+		    list_is_last(&ld->l, &prog->insns))
+			break;
+		st = list_next_entry(ld, l);
+		if (st->insn.code != (BPF_STX | BPF_MEM | BPF_B) ||
+		    st->ptr.type != PTR_TO_PACKET ||
+		    st->insn.dst_reg != base || st->insn.src_reg != tmp ||
+		    st->bpf_insn_idx != ld->bpf_insn_idx + 1 ||
+		    st->is_merge_point || (st->flags & FLAG_INSN_IS_JUMP_DST) ||
+		    st->percpu_rmw_add ||
+		    st->subprog_idx != first->subprog_idx)
+			break;
+		if (!i)
+			delta = (int)st->insn.off - ld->insn.off;
+		if ((int)st->insn.off - ld->insn.off != delta)
+			break;
+		for (j = 0; j < i; j++)
+			if (offsets[j] == ld->insn.off)
+				return;
+		offsets[i] = ld->insn.off;
+		lo = min(lo, offsets[i]);
+		hi = max(hi, offsets[i]);
+		/* The union must be contiguous, with no overlapping source/dest.
+		 * Preserve original order between groups; never widen across gaps.
+		 */
+		if (hi - lo == i && abs(delta) >= i + 1) {
+			best = i + 1;
+			start = lo;
+			last = offsets[i];
+		}
+		if (list_is_last(&st->l, &prog->insns))
+			break;
+		ld = list_next_entry(st, l);
+	}
+	if (best < 2)
+		return;
+
+	first->copy = (struct knod_bpf_copy) {
+		.src_off = start,
+		.dst_off = start + delta,
+		.bytes = best,
+		.last_byte = last - start,
+		.base_reg = base,
+		.value_reg = tmp,
+		.result_dead = !(knod_bpf_live_after_group(prog, first, 2 * best) &
+				 (1U << tmp)),
+	};
+}
+
+/* Restrict forwarding to exact, private packet accesses. The proof is a BPF
+ * value, not a target register or a cached packet window.
+ */
+static int knod_bpf_packet_width(const struct knod_insn_meta *meta)
+{
+	if (meta->ptr.type != PTR_TO_PACKET ||
+	    BPF_MODE(meta->insn.code) != BPF_MEM)
+		return 0;
+	switch (BPF_SIZE(meta->insn.code)) {
+	case BPF_B:
+		return 1;
+	case BPF_H:
+		return 2;
+	case BPF_W:
+		return 4;
+	case BPF_DW:
+		return 8;
+	default:
+		return 0;
+	}
+}
+
+static void knod_bpf_analyze_packet_imm(struct knod_prog *prog,
+					struct knod_insn_meta *store)
+{
+	struct knod_insn_meta *meta, *prev;
+	int width = knod_bpf_packet_width(store);
+	int base = store->insn.dst_reg, off = store->insn.off;
+	unsigned int value, count;
+
+	if (!width || width > 4 || store->percpu_rmw_add)
+		return;
+	if (BPF_CLASS(store->insn.code) == BPF_ST) {
+		value = store->insn.imm;
+	} else if (BPF_CLASS(store->insn.code) == BPF_STX) {
+		if (store->l.prev == &prog->insns || store->is_merge_point ||
+		    (store->flags & FLAG_INSN_IS_JUMP_DST))
+			return;
+		prev = list_prev_entry(store, l);
+		if ((prev->insn.code != (BPF_ALU | BPF_MOV | BPF_K) &&
+		     prev->insn.code != (BPF_ALU64 | BPF_MOV | BPF_K)) ||
+		    prev->insn.dst_reg != store->insn.src_reg ||
+		    prev->bpf_insn_idx + 1 != store->bpf_insn_idx ||
+		    prev->subprog_idx != store->subprog_idx)
+			return;
+		value = prev->insn.imm;
+	} else {
+		return;
+	}
+	if (width < 4)
+		value &= (1U << (8 * width)) - 1;
+
+	/* A bounded local scan keeps compilation linear. Unknown writes may
+	 * alias this packet even through a different BPF base, so stop there.
+	 * Never carry a value across a helper, control transfer or EXEC merge.
+	 */
+	prev = store;
+	for (count = 0; count < 32; count++, prev = meta) {
+		int size;
+
+		if (list_is_last(&prev->l, &prog->insns))
+			break;
+		meta = list_next_entry(prev, l);
+		if (meta->bpf_insn_idx != prev->bpf_insn_idx + 1 ||
+		    meta->subprog_idx != store->subprog_idx ||
+		    meta->is_merge_point || (meta->flags & FLAG_INSN_IS_JUMP_DST))
+			break;
+
+		switch (BPF_CLASS(meta->insn.code)) {
+		case BPF_ALU:
+		case BPF_ALU64:
+			if (meta->insn.dst_reg == base)
+				return;
+			break;
+		case BPF_LDX:
+			if (BPF_MODE(meta->insn.code) != BPF_MEM)
+				return;
+			size = knod_bpf_packet_width(meta);
+			if (meta->insn.src_reg == base && size == width &&
+			    meta->insn.off == off) {
+				meta->packet_imm = value;
+				meta->packet_imm_valid = true;
+			}
+			if (meta->insn.dst_reg == base)
+				return;
+			break;
+		case BPF_ST:
+		case BPF_STX:
+			size = knod_bpf_packet_width(meta);
+			if (!size || meta->percpu_rmw_add ||
+			    meta->insn.dst_reg != base ||
+			    (meta->insn.off < off + width && off < meta->insn.off + size))
+				return;
+			break;
+		default:
+			return;
+		}
+	}
+}
+
+/* Only packet-owned bytes may be combined. No intervening load, register
+ * write, helper or control-flow entry is moved across the store group.
+ */
+static void knod_bpf_analyze_store(struct knod_prog *prog,
+				   struct knod_insn_meta *first)
+{
+	struct knod_insn_meta *meta = first;
+	int offsets[16], regs[16], lo = SHRT_MAX, hi = SHRT_MIN;
+	int base = first->insn.dst_reg, best = 0, start = 0, i, j;
+
+	for (i = 0; i < ARRAY_SIZE(offsets); i++) {
+		if (meta->insn.code != (BPF_STX | BPF_MEM | BPF_B) ||
+		    meta->ptr.type != PTR_TO_PACKET || meta->percpu_rmw_add ||
+		    meta->insn.dst_reg != base ||
+		    meta->subprog_idx != first->subprog_idx ||
+		    meta->bpf_insn_idx != first->bpf_insn_idx + i ||
+		    (i && (meta->is_merge_point ||
+			   (meta->flags & FLAG_INSN_IS_JUMP_DST))))
+			break;
+		for (j = 0; j < i; j++)
+			if (offsets[j] == meta->insn.off)
+				goto done;
+		offsets[i] = meta->insn.off;
+		regs[i] = meta->insn.src_reg;
+		lo = min(lo, offsets[i]);
+		hi = max(hi, offsets[i]);
+		if (hi - lo == i) {
+			best = i + 1;
+			start = lo;
+		}
+		if (list_is_last(&meta->l, &prog->insns))
+			break;
+		meta = list_next_entry(meta, l);
+	}
+ done:
+	if (best < 2)
+		return;
+	first->store.bytes = best;
+	first->store.off = start;
+	first->store.base_reg = base;
+	for (i = 0; i < best; i++)
+		first->store.value_reg[offsets[i] - start] = regs[i];
+}
+
+static void knod_bpf_analyze_loads(struct knod_prog *prog,
+				   struct knod_insn_meta *first)
+{
+	struct knod_insn_meta *m = first, *prev = NULL;
+	struct knod_memory_load_group group = {};
+	for (;;) {
+		struct knod_memory_fact f =
+		    knod_memory_fact(&m->insn, m->ptr.type == PTR_TO_PACKET
+						   ? KNOD_MEMORY_PACKET
+						   : KNOD_MEMORY_UNKNOWN);
+		bool boundary =
+		    m->is_merge_point || (m->flags & FLAG_INSN_IS_JUMP_DST);
+		if (prev && (m->bpf_insn_idx != prev->bpf_insn_idx + 1 ||
+			     m->subprog_idx != first->subprog_idx))
+			break;
+		if (!knod_memory_load_append(&group, &f, boundary))
+			break;
+		if (list_is_last(&m->l, &prog->insns))
+			break;
+		prev = m;
+		m = list_next_entry(m, l);
+	}
+	if (group.count > 1)
+		first->loads = group;
+}
+static void knod_bpf_analyze_memory(struct knod_prog *prog)
+{
+	struct knod_insn_meta *meta;
+	unsigned int remaining = 0;
+
+	list_for_each_entry(meta, &prog->insns, l) {
+		memset(&meta->copy, 0, sizeof(meta->copy));
+		memset(&meta->store, 0, sizeof(meta->store));
+		meta->packet_imm_valid = false;
+		memset(&meta->loads, 0, sizeof(meta->loads));
+		if (remaining) {
+			remaining--;
+			continue;
+		}
+		knod_bpf_analyze_loads(prog, meta);
+		if (meta->loads.count) {
+			remaining = meta->loads.count - 1;
+			continue;
+		}
+		knod_bpf_analyze_copy(prog, meta);
+		if (meta->copy.bytes) {
+			remaining = 2 * meta->copy.bytes - 1;
+		} else {
+			knod_bpf_analyze_store(prog, meta);
+			if (meta->store.bytes)
+				remaining = meta->store.bytes - 1;
+		}
+	}
+	list_for_each_entry(meta, &prog->insns, l)
+		knod_bpf_analyze_packet_imm(prog, meta);
+}
+
+static unsigned int knod_bpf_region_chunks(unsigned int bytes)
+{
+	unsigned int n = 0;
+
+	while (bytes) {
+		bytes -= knod_memory_chunk_width(bytes);
+		n++;
+	}
+	return n;
+}
+
+/* This small region accepts only byte memory transfers and immediate MOVs.
+ * Byte versions are resolved at compile time; no register cache survives the
+ * fused emission. Inputs and outputs must be exact disjoint packet ranges.
+ */
+static void knod_bpf_plan_packet_region(struct knod_prog *prog,
+		struct knod_insn_meta *first, int limit)
+{
+	struct knod_bpf_packet_region plan = {}, best = {};
+	struct knod_region_value value[10];
+	struct knod_insn_meta *meta = first, *prev = NULL;
+	unsigned int out_mask = 0, in_mask = 0, old_stores = 0;
+	unsigned int constants = 0, cover = 0, step, r;
+	int base = -1;
+
+	for (r = 0; r < 10; r++)
+		value[r] = (struct knod_region_value) {
+			.kind = KNOD_REGION_ENTRY, .reg = r,
+		};
+	for (step = 0; step < 32; step++) {
+		const struct bpf_insn *i = &meta->insn;
+		bool load = i->code == (BPF_LDX | BPF_MEM | BPF_B);
+		bool store = i->code == (BPF_STX | BPF_MEM | BPF_B) ||
+			     i->code == (BPF_ST | BPF_MEM | BPF_B);
+		bool mov = i->code == (BPF_ALU | BPF_MOV | BPF_K) ||
+			   i->code == (BPF_ALU64 | BPF_MOV | BPF_K);
+		unsigned int span;
+		int pos, width;
+
+		if ((!load && !store && !mov) || meta->percpu_rmw_add ||
+		    meta->bpf_insn_idx < 0 || i->dst_reg > 9 ||
+		    (prev && (meta->is_merge_point ||
+			(meta->flags & FLAG_INSN_IS_JUMP_DST) ||
+			meta->subprog_idx != first->subprog_idx ||
+			meta->bpf_insn_idx != prev->bpf_insn_idx + 1)))
+			break;
+		/* Existing groups must be wholly enclosed, not cut in half. */
+		if (!cover) {
+			span = meta->loads.count ? meta->loads.count :
+				meta->copy.bytes ? 2 * meta->copy.bytes : meta->store.bytes;
+			cover = span ? span : 1;
+			if (meta->copy.bytes)
+				old_stores += knod_bpf_region_chunks(meta->copy.bytes);
+			else if (meta->store.bytes)
+				old_stores += knod_bpf_region_chunks(meta->store.bytes);
+			else if (store)
+				old_stores++;
+		}
+		cover--;
+		if (mov) {
+			if (i->off || i->dst_reg == base)
+				break;
+			value[i->dst_reg] = (struct knod_region_value) {
+				.kind = KNOD_REGION_IMM,
+				.imm = BPF_CLASS(i->code) == BPF_ALU ?
+					(u64)(u32)i->imm : (u64)(s64)i->imm,
+			};
+			plan.changed |= 1U << i->dst_reg;
+		} else {
+			int addr = load ? i->src_reg : i->dst_reg;
+
+			if (addr > 9 || meta->ptr.type != PTR_TO_PACKET ||
+			    (plan.changed & (1U << addr)) ||
+			    (base >= 0 && addr != base) ||
+			    i->off < -limit || i->off >= limit ||
+			    (load && (i->imm || i->dst_reg == addr)))
+				break;
+			base = addr;
+			plan.base = base;
+			if (load) {
+				if (!in_mask)
+					plan.input_off = i->off;
+				pos = i->off - plan.input_off;
+				if (pos < 0) {
+					if (-pos + plan.input_bytes > 8)
+						break;
+					in_mask <<= -pos;
+					plan.input_bytes += -pos;
+					plan.input_off = i->off;
+					pos = 0;
+				}
+				if (pos >= 8)
+					break;
+				in_mask |= 1U << pos;
+				plan.input_bytes = max_t(unsigned int, plan.input_bytes, pos + 1);
+				value[i->dst_reg] = (struct knod_region_value) {
+					.kind = KNOD_REGION_PACKET, .off = i->off,
+				};
+				plan.changed |= 1U << i->dst_reg;
+			} else {
+				struct knod_region_value v;
+
+				if (BPF_CLASS(i->code) == BPF_ST)
+					v = (struct knod_region_value) {
+						.kind = KNOD_REGION_IMM, .imm = (u8)i->imm,
+					};
+				else {
+					if (i->src_reg > 9 || i->imm)
+						break;
+					v = value[i->src_reg];
+				}
+				if (!out_mask)
+					plan.off = i->off;
+				pos = i->off - plan.off;
+				if (pos < 0) {
+					if (-pos + plan.bytes > 16)
+						break;
+					memmove(plan.output - pos, plan.output,
+						plan.bytes * sizeof(plan.output[0]));
+					out_mask <<= -pos;
+					plan.bytes += -pos;
+					plan.off = i->off;
+					pos = 0;
+				}
+				if (pos >= 16 || (out_mask & (1U << pos)))
+					break;
+				out_mask |= 1U << pos;
+				plan.output[pos] = v;
+				plan.bytes = max_t(unsigned int, plan.bytes, pos + 1);
+				constants += v.kind == KNOD_REGION_IMM;
+			}
+		}
+		/* No moved load can observe an output store, even one later in
+		 * the region. Holes must not be filled by speculative reads.
+		 */
+		if (in_mask && out_mask &&
+		    plan.input_off < plan.off + plan.bytes &&
+		    plan.off < plan.input_off + plan.input_bytes)
+			break;
+		width = knod_bpf_region_chunks(plan.bytes);
+		if (!cover && plan.bytes >= 8 && in_mask &&
+		    out_mask == (1U << plan.bytes) - 1 &&
+		    in_mask == (1U << plan.input_bytes) - 1 &&
+		    plan.input_off + plan.input_bytes <= limit &&
+		    plan.off + plan.bytes <= limit &&
+		    old_stores > constants + width) {
+			/* Subtract every constant store as a conservative allowance
+			 * for the following constant-store pass's possible savings.
+			 */
+			plan.count = step + 1;
+			memcpy(plan.final, value, sizeof(value));
+			best = plan;
+		}
+		prev = meta;
+		if (list_is_last(&meta->l, &prog->insns))
+			break;
+		meta = list_next_entry(meta, l);
+	}
+	if (!best.count)
+		return;
+	meta = first;
+	for (step = 0; step < best.count; step++) {
+		memset(&meta->loads, 0, sizeof(meta->loads));
+		memset(&meta->copy, 0, sizeof(meta->copy));
+		memset(&meta->store, 0, sizeof(meta->store));
+		meta->packet_imm_valid = false;
+		if (step + 1 < best.count)
+			meta = list_next_entry(meta, l);
+	}
+	first->packet_region = best;
+}
+
+static void knod_bpf_analyze_packet_regions(struct knod_bpf_priv *priv,
+					  struct knod_prog *prog)
+{
+	struct knod_insn_meta *meta;
+	unsigned int remaining = 0, span;
+	int limit;
+
+	list_for_each_entry(meta, &prog->insns, l)
+		memset(&meta->packet_region, 0, sizeof(meta->packet_region));
+	if (priv->isa_version != 10 && priv->isa_version != 11)
+		return;
+	limit = priv->isa_version == 10 ? 2048 : 4096;
+	list_for_each_entry(meta, &prog->insns, l) {
+		if (remaining) {
+			remaining--;
+			continue;
+		}
+		span = meta->loads.count ? meta->loads.count :
+			meta->copy.bytes ? 2 * meta->copy.bytes : meta->store.bytes;
+		knod_bpf_plan_packet_region(prog, meta, limit);
+		remaining = meta->packet_region.count ? meta->packet_region.count - 1 :
+			span ? span - 1 : 0;
+	}
+}
+
+static void knod_bpf_region_byte(struct knod_bpf_priv *priv,
+		struct knod_insn_meta *meta, const struct knod_bpf_packet_region *p,
+		const struct knod_region_value *v, struct amdgcn_param32 dst)
+{
+	struct amdgcn_param32 src, shift, bits;
+
+	if (v->kind == KNOD_REGION_IMM) {
+		knod_iset32(&src, (u8)v->imm);
+		knod_mov32(priv, meta, dst, src);
+		return;
+	}
+	if (v->kind == KNOD_REGION_ENTRY) {
+		src = bpf_reg64[v->reg].lo;
+		knod_iset32(&shift, 0);
+	} else {
+		int pos = v->off - p->input_off;
+
+		knod_vset32(&src, KNOD_AMDGPU_TMP_VREG2_LO + pos / 4);
+		knod_iset32(&shift, (pos % 4) * 8);
+	}
+	knod_iset32(&bits, 8);
+	knod_bfe32(priv, meta, dst, src, shift, bits);
+}
+
+/* Task-local target-independent prototype. No AMD instruction/register IDs. */
+
+
+
+
+
+static unsigned sr_width(unsigned bytes)
+{
+	return bytes >= 16   ? 16
+	       : bytes >= 12 ? 12
+	       : bytes >= 8  ? 8
+	       : bytes >= 4  ? 4
+	       : bytes >= 2  ? 2
+			     : 1;
+}
+static void sr_set(u64 b[2], unsigned i) { b[i / 64] |= 1ULL << (i % 64); }
+static bool sr_has(const u64 b[2], unsigned i) { return (b[i / 64] >> (i % 64)) & 1; }
+/* Caller supplies a bounded DAG of semantic selected forms. Every surviving
+ * path must reach last; no backward edge, early exit, or interior entry.
+ * Scratch is caller-owned to avoid an oversized kernel stack frame.
+ */
+
+static bool sr_plan_region(const struct sr_node *nodes, unsigned n, const struct sr_store *stores,
+			   unsigned count, struct sr_scratch *scratch, struct sr_plan *out)
+{
+	struct sr_plan *p = &scratch->draft;
+	unsigned i, j, k, slots = 0, end, lo = 65535, hi = 0, flushes = 0;
+	memset(out, 0, sizeof(*out));
+	memset(scratch, 0, sizeof(*scratch));
+	if (!n || n > SR_NODES || count < 2 || count > SR_STORES)
+		return false;
+	for (i = 0; i < count; i++) {
+		const struct sr_store *s = &stores[i];
+		if (s->node >= n || !s->width || s->width > 16 || s->width != sr_width(s->width) ||
+		    s->base > 9 || s->offset < 0 ||
+		    (i && (s->node < stores[i - 1].node || s->base != stores[0].base)))
+			return false;
+		if (i && s->node == stores[i - 1].node && s->ordinal != stores[i - 1].ordinal + 1)
+			return false;
+		if ((!i || s->node != stores[i - 1].node) && s->ordinal)
+			return false;
+		if ((unsigned)s->offset < lo)
+			lo = s->offset;
+		end = s->offset + s->width;
+		if (end > hi)
+			hi = end;
+		slots += (s->width + 3) / 4;
+	}
+	if (hi - lo > SR_BYTES || slots > SR_WORDS || stores[count - 1].node != n - 1)
+		return false;
+	scratch->reached[0] = true;
+	sr_set(scratch->dom[0], 0);
+	for (i = 0; i < n; i++) {
+		const struct sr_node *q = &nodes[i];
+		if (!scratch->reached[i] || q->forbidden || q->base_changed ||
+		    q->unresolved_overlap_read || (i && q->outside_entry) || q->group_last < i ||
+		    q->group_last >= n)
+			return false;
+		if (i == n - 1) {
+			if (q->successor_count)
+				return false;
+			continue;
+		}
+		if (!q->successor_count || q->successor_count > 2)
+			return false;
+		for (j = 0; j < q->successor_count; j++) {
+			k = q->successor[j];
+			if (k <= i || k >= n)
+				return false;
+			if (!scratch->reached[k]) {
+				memcpy(scratch->dom[k], scratch->dom[i], 16);
+				scratch->reached[k] = true;
+			} else {
+				scratch->dom[k][0] &= scratch->dom[i][0];
+				scratch->dom[k][1] &= scratch->dom[i][1];
+			}
+			sr_set(scratch->dom[k], k);
+		}
+	}
+	sr_set(scratch->post[n - 1], n - 1);
+	for (i = n - 1; i-- > 0;) {
+		memcpy(scratch->post[i], scratch->post[nodes[i].successor[0]], 16);
+		for (j = 1; j < nodes[i].successor_count; j++)
+			for (k = 0; k < 2; k++)
+				scratch->post[i][k] &= scratch->post[nodes[i].successor[j]][k];
+		sr_set(scratch->post[i], i);
+	}
+	memset(p->byte, 255, sizeof(p->byte));
+	slots = 0;
+	for (i = 0; i < count; i++) {
+		const struct sr_store *s = &stores[i];
+		if (!sr_has(scratch->dom[n - 1], s->node) || !sr_has(scratch->post[s->node], n - 1))
+			return false;
+		p->capture[i] = (struct sr_capture){*s, slots};
+		for (j = 0; j < s->width; j++) {
+			struct sr_byte *b = &p->byte[s->offset - lo + j];
+			if (b->slot != 255)
+				return false;
+			*b = (struct sr_byte){slots + j / 4, (j % 4) * 8};
+		}
+		slots += (s->width + 3) / 4;
+	}
+	for (i = 0; i < hi - lo; i++)
+		if (p->byte[i].slot == 255)
+			return false;
+	for (i = 0; i < hi - lo; i += sr_width(hi - lo - i))
+		flushes++;
+	if (flushes >= count)
+		return false;
+	p->count = count;
+	p->slots = slots;
+	p->bytes = hi - lo;
+	p->offset = lo;
+	p->base = stores[0].base;
+	p->flush_node = n - 1;
+	p->flush_count = flushes;
+	*out = *p;
+	return true;
+}
+/* Native backend only. Semantic planner sees abstract slots, never VGPRs. */
+#define KNOD_SR_CAPTURE_BASE (KNOD_AMDGPU_TMP_VREG3_HI + 1)
+static void knod_bpf_sr_emit_normal(struct knod_bpf_priv *priv, struct knod_insn_meta *m, int width,
+				    struct amdgcn_param32 src, int base, int off)
+{
+	switch (width) {
+	case 16:
+		knod_emit(priv, m, global_store_dwordx4, src, bpf_reg64[base].lo, off);
+		break;
+	case 12:
+		knod_emit(priv, m, global_store_dwordx3, src, bpf_reg64[base].lo, off);
+		break;
+	case 8:
+		knod_emit(priv, m, global_store_dwordx2, src, bpf_reg64[base].lo, off);
+		break;
+	case 4:
+		knod_emit(priv, m, global_store_dword, src, bpf_reg64[base].lo, off);
+		break;
+	case 2:
+		knod_emit(priv, m, global_store_short, src, bpf_reg64[base].lo, off);
+		break;
+	default:
+		knod_emit(priv, m, global_store_byte, src, bpf_reg64[base].lo, off);
+		break;
+	}
+}
+/* A full output word may join one source suffix to another's prefix. */
+static bool knod_bpf_sr_align_word(struct knod_bpf_priv *priv,
+				 struct knod_insn_meta *m, const struct sr_plan *p,
+				 int pos, struct amdgcn_param32 dst)
+{
+	const struct sr_byte *b;
+	struct amdgcn_param32 low, high, shift;
+	int first, i, low_reg, high_reg;
+
+	if (priv->isa_version != 10 || m->jit_engine != 1 ||
+	    pos < 0 || p->bytes < 4 || pos > p->bytes - 4 ||
+	    !p->slots || p->slots > SR_WORDS)
+		return false;
+	b = &p->byte[pos];
+	if (b[0].shift != 8 && b[0].shift != 16 && b[0].shift != 24)
+		return false;
+	first = 4 - b[0].shift / 8;
+	if (b[0].slot >= p->slots || b[first].slot >= p->slots)
+		return false;
+	for (i = 0; i < 4; i++) {
+		int slot = i < first ? b[0].slot : b[first].slot;
+		int bits = i < first ? b[0].shift + i * 8 : (i - first) * 8;
+
+		if (b[i].slot != slot || b[i].shift != bits)
+			return false;
+	}
+	low_reg = KNOD_SR_CAPTURE_BASE + b[0].slot;
+	high_reg = KNOD_SR_CAPTURE_BASE + b[first].slot;
+	if (dst.type != AMDGCN_PARAM_TYPE_VGPR ||
+	    dst.v == low_reg || dst.v == high_reg)
+		return false;
+	knod_vset32(&low, low_reg);
+	knod_vset32(&high, high_reg);
+	knod_iset32(&shift, b[0].shift);
+	knod_emit(priv, m, v_alignbit_b32, dst, high, low, shift);
+	return true;
+}
+
+static void knod_bpf_sr_flush(struct knod_bpf_priv *priv, struct knod_insn_meta *m,
+			      const struct sr_plan *p)
+{
+	struct amdgcn_param32 dst, src, tmp, shift, bits;
+	int off, width, j, run;
+	knod_vset32(&tmp, KNOD_AMDGPU_TMP_VREG3_HI);
+	for (off = 0; off < p->bytes; off += width) {
+		width = sr_width(p->bytes - off);
+		for (j = 0; j < width; j += run) {
+			const struct sr_byte *b = &p->byte[off + j];
+			run = 1;
+			while (j + run < width && (j % 4) + run < 4 && b->shift + run * 8 < 32 &&
+			       p->byte[off + j + run].slot == b->slot &&
+			       p->byte[off + j + run].shift == b->shift + run * 8)
+				run++;
+			knod_vset32(&dst, KNOD_AMDGPU_TMP_VREG0_LO + j / 4);
+			if (!(j % 4) && j + 4 <= width &&
+			    knod_bpf_sr_align_word(priv, m, p, off + j, dst)) {
+				run = 4;
+				continue;
+			}
+			knod_vset32(&src, KNOD_SR_CAPTURE_BASE + b->slot);
+			if (run == 4)
+				knod_mov32(priv, m, dst, src);
+			else {
+				knod_iset32(&shift, b->shift);
+				knod_iset32(&bits, run * 8);
+				knod_bfe32(priv, m, j % 4 ? tmp : dst, src, shift, bits);
+				if (j % 4) {
+					knod_iset32(&shift, (j % 4) * 8);
+					knod_emit(priv, m, v_lshl_or_b32, dst, tmp, shift, dst);
+				}
+			}
+		}
+		knod_vset32(&src, KNOD_AMDGPU_TMP_VREG0_LO);
+		knod_bpf_sr_emit_normal(priv, m, width, src, p->base, p->offset + off);
+	}
+}
+/* Source comes from the existing packer exactly when its original store
+ * would issue. A descriptor mismatch is a compile failure, never partial
+ * fallback after earlier captures. Caller must discard failed generation.
+ */
+static bool knod_bpf_sr_store(struct knod_bpf_priv *priv, struct knod_insn_meta *m,
+			      const struct sr_plan *plan, unsigned descriptor, int width,
+			      struct amdgcn_param32 src, int base, int off)
+{
+	const struct sr_capture *c;
+	struct amdgcn_param32 dst, word;
+	int j;
+	if (!plan) {
+		knod_bpf_sr_emit_normal(priv, m, width, src, base, off);
+		return true;
+	}
+	if (descriptor >= plan->count || src.type != AMDGCN_PARAM_TYPE_VGPR || src.v < 0 ||
+	    src.v + (width + 3) / 4 > KNOD_SR_CAPTURE_BASE)
+		return false;
+	c = &plan->capture[descriptor];
+	if (c->store.width != width || c->store.base != base || c->store.offset != off)
+		return false;
+	for (j = 0; j < (width + 3) / 4; j++) {
+		knod_vset32(&dst, KNOD_SR_CAPTURE_BASE + c->first_slot + j);
+		knod_vset32(&word, src.v + j);
+		knod_mov32(priv, m, dst, word);
+	}
+	if (descriptor + 1 == plan->count)
+		knod_bpf_sr_flush(priv, m, plan);
+	return true;
+}
+/* Bounded selected-form adapter. No decoded AMD instructions participate. */
+struct knod_sr_workspace {
+	struct sr_node nodes[SR_NODES];
+	struct sr_store stores[SR_STORES];
+	struct knod_insn_meta *meta[SR_NODES];
+	struct sr_scratch scratch;
+	struct sr_plan plan;
+};
+static bool knod_sr_middle(struct knod_insn_meta *m)
+{
+	const struct bpf_insn *i = &m->insn;
+	int cls = BPF_CLASS(i->code), op = BPF_OP(i->code);
+	if (m->sink.member || m->store_hoist.elide || m->conststore.elide || m->packet_imm_valid)
+		return true;
+	if (cls == BPF_ALU64 && (op == BPF_ADD || op == BPF_AND || op == BPF_XOR || op == BPF_RSH))
+		return true;
+	if ((cls == BPF_ALU || cls == BPF_ALU64) && op == BPF_MOV && !i->off)
+		return true;
+	if (cls == BPF_ALU && op == BPF_END && (i->imm == 16 || i->imm == 32 || i->imm == 64))
+		return true;
+	if (i->code == (BPF_LD | BPF_IMM | BPF_DW) && !i->src_reg)
+		return true;
+	if (i->code == (BPF_JMP | BPF_JEQ | BPF_K) && i->off > 0 &&
+	    m->branch_type == KNOD_BR_FORWARD_SKIP)
+		return true;
+	if (i->code == (BPF_LDX | BPF_MEM | BPF_DW) && m->ptr.type == PTR_TO_STACK &&
+	    !((m->sreg.stack_off + i->off) & 3))
+		return true;
+	if (i->code == (BPF_LDX | BPF_MEM | BPF_B) && m->ptr.type == PTR_TO_STACK)
+		return true;
+	return i->code == (BPF_LDX | BPF_MEM | BPF_W) && m->ptr.type == PTR_TO_MAP_VALUE;
+}
+static bool knod_sr_append(struct knod_sr_workspace *w, unsigned *count, unsigned node, int base,
+			   int off, unsigned bytes)
+{
+	unsigned j, width, ordinal = 0;
+	if (off < 0 || !bytes || off + bytes > 2048)
+		return false;
+	for (j = 0; j < bytes; j += width) {
+		width = sr_width(bytes - j);
+		if (*count == SR_STORES)
+			return false;
+		w->stores[(*count)++] = (struct sr_store){node, width, base, ordinal++, off + j};
+	}
+	return true;
+}
+/* Fully prepare the slice in private workspace; do not set live meta flags
+ * until the DAG, alias, selected-form and capacity checks all succeed. */
+static bool knod_sr_try(struct knod_prog *prog, struct knod_insn_meta *first,
+			struct knod_sr_workspace *w)
+{
+	struct knod_insn_meta *m = first, *other;
+	unsigned n = 0, count = 0, opaque = 0, i, j;
+	int base = first->packet_region.base;
+	if (!first->packet_region.count || first->sr.owner)
+		return false;
+	memset(w, 0, sizeof(*w));
+	while (n < SR_NODES) {
+		struct sr_node *node = &w->nodes[n];
+		const struct bpf_insn *in = &m->insn;
+		struct knod_bpf_effect effect = knod_bpf_effect(in);
+		bool output = false,
+		     extension = n && w->meta[n - 1]->insn.code == (BPF_LD | BPF_IMM | BPF_DW);
+		if (m->sr.owner || m->subprog_idx != first->subprog_idx || m->bpf_insn_idx < 0 ||
+		    (n && m->bpf_insn_idx != w->meta[n - 1]->bpf_insn_idx + 1) ||
+		    m->map_widen.owned || m->wide_read.owned || m->read_batch.owned || m->load_pair.owned || m->percpu_dead || m->percpu_rmw_add)
+			return false;
+		w->meta[n] = m;
+		node->group_last = n;
+		if (!extension && (effect.defs & (1U << base)))
+			return false;
+		if (opaque) {
+			opaque--;
+		} else if (m->packet_region.count) {
+			if (n || m->packet_region.base != base ||
+			    m->packet_region.count > SR_NODES - n)
+				return false;
+			opaque = m->packet_region.count - 1;
+			node->group_last = n + opaque;
+			if (!knod_sr_append(w, &count, n, base, m->packet_region.off,
+					    m->packet_region.bytes))
+				return false;
+			output = true;
+		} else if (m->sink.bytes && !m->sink.forward) {
+			if (m->sink.base != base ||
+			    !knod_sr_append(w, &count, n, base, m->sink.off, m->sink.bytes))
+				return false;
+			output = true;
+		} else if (m->store_hoist.emit) {
+			if (m->store_hoist.base != base ||
+			    !knod_sr_append(w, &count, n, base, m->store_hoist.off, 8))
+				return false;
+			output = true;
+		} else if (m->conststore.bytes) {
+			if (m->conststore.base != base ||
+			    !knod_sr_append(w, &count, n, base, m->conststore.off,
+					    m->conststore.bytes))
+				return false;
+			output = true;
+		} else if (m->memory_group_owned || m->loads.count || m->copy.bytes ||
+			   m->store.bytes)
+			return false;
+		else if (BPF_CLASS(in->code) == BPF_STX && BPF_MODE(in->code) == BPF_MEM &&
+			 m->ptr.type == PTR_TO_PACKET && !m->sink.member && !m->store_hoist.elide &&
+			 !m->conststore.elide) {
+			if (in->dst_reg != base ||
+			    !knod_sr_append(w, &count, n, base, in->off, knod_bpf_packet_width(m)))
+				return false;
+			output = true;
+		} else if (extension) {
+			if (in->code)
+				return false;
+		} else if (!knod_sr_middle(m))
+			return false;
+		/* Raw group members are represented by the selected entry emitter. */
+		if (n)
+			w->nodes[n - 1].successor_count = w->nodes[n - 1].successor_count ?: 1;
+		if (n && !w->nodes[n - 1].successor[0])
+			w->nodes[n - 1].successor[0] = n;
+		if (output && !opaque && count > 1) {
+			bool valid = true;
+			/* Resolve raw forward edges and detect all outside incoming jumps. */
+			for (i = 0; i <= n; i++) {
+				struct knod_insn_meta *q = w->meta[i];
+				w->nodes[i].successor_count = i == n ? 0 : 1;
+				w->nodes[i].successor[0] = i + 1;
+				if (q->insn.code == (BPF_JMP | BPF_JEQ | BPF_K)) {
+					int target = q->bpf_insn_idx + 1 + q->insn.off;
+					for (j = i + 1;
+					     j <= n && w->meta[j]->bpf_insn_idx != target; j++)
+						;
+					if (j > n || q->merge_point != w->meta[j]) {
+						valid = false;
+						break;
+					}
+					w->nodes[i].successor_count = 2;
+					w->nodes[i].successor[1] = j;
+				}
+			}
+			list_for_each_entry(other, &prog->insns, l)
+			{
+				int cls = BPF_CLASS(other->insn.code),
+				    op = BPF_OP(other->insn.code);
+				s64 target;
+				if (cls != BPF_JMP && cls != BPF_JMP32)
+					continue;
+				if (op == BPF_CALL || op == BPF_EXIT)
+					continue;
+				if (other->bpf_insn_idx >= first->bpf_insn_idx &&
+				    other->bpf_insn_idx <= m->bpf_insn_idx)
+					continue;
+				/* Synthetic jumps have no raw BPF displacement. */
+				if (other->bpf_insn_idx < 0) {
+					if (!other->merge_point) {
+						valid = false;
+						break;
+					}
+					target = other->merge_point->bpf_insn_idx;
+				} else {
+					/* JA32 carries its displacement in imm, not off. */
+					target = (s64)other->bpf_insn_idx + 1 +
+						 (cls == BPF_JMP32 && op == BPF_JA ?
+						  other->insn.imm : other->insn.off);
+				}
+				if (target > first->bpf_insn_idx && target <= m->bpf_insn_idx) {
+					valid = false;
+					break;
+				}
+			}
+			if (valid && sr_plan_region(w->nodes, n + 1, w->stores, count, &w->scratch,
+						    &w->plan)) {
+				first->sr.plan = w->plan;
+				for (i = 0; i < count; i++) {
+					struct knod_insn_meta *q = w->meta[w->stores[i].node];
+					if (!q->sr.count)
+						q->sr.first = i;
+					q->sr.owner = first;
+					q->sr.count++;
+				}
+				return true;
+			}
+		}
+		if (list_is_last(&m->l, &prog->insns))
+			break;
+		m = list_next_entry(m, l);
+		n++;
+	}
+	return false;
+}
+static void knod_bpf_analyze_store_regions(struct knod_bpf_priv *priv, struct knod_prog *prog)
+{
+	struct knod_insn_meta *m;
+	struct knod_sr_workspace *w;
+	list_for_each_entry(m, &prog->insns, l) memset(&m->sr, 0, sizeof(m->sr));
+	if (priv->isa_version != 10)
+		return;
+	w = kzalloc(sizeof(*w), GFP_KERNEL);
+	if (!w)
+		return;
+	list_for_each_entry(m, &prog->insns, l) knod_sr_try(prog, m, w);
+	kfree(w);
+}
+static void knod_bpf_packet_store(struct knod_bpf_priv *priv, struct knod_insn_meta *m, int width,
+				  struct amdgcn_param32 src, int base, int off)
+{
+	const struct sr_plan *p = m->sr.owner ? &m->sr.owner->sr.plan : NULL;
+	if (!knod_bpf_sr_store(priv, m, p, m->sr.first + m->sr.cursor, width, src, base, off))
+		m->sr.error = true;
+	if (p)
+		m->sr.cursor++;
+}
+
+static void knod_bpf_emit_region_inputs(struct knod_bpf_priv *priv,
+				       struct knod_insn_meta *first,
+				       const struct knod_bpf_packet_region *p)
+{
+	struct amdgcn_param32 data;
+	unsigned int off, width, input_chunk = 0;
+
+	/* Input bytes occupy v26/v27, packed output v22..25, scratch v29.
+	 * Full contiguous input range is at most eight bytes, without holes.
+	 */
+	for (off = 0; off < p->input_bytes; off += width) {
+		width = knod_memory_chunk_width(p->input_bytes - off);
+		knod_vset32(&data, input_chunk < 2 ?
+			KNOD_AMDGPU_TMP_VREG2_LO + input_chunk :
+			KNOD_AMDGPU_TMP_VREG3_HI);
+		input_chunk++;
+		if (width == 8)
+			knod_emit(priv, first, global_load_dwordx2, data, bpf_reg64[p->base].lo, p->input_off + off);
+		else if (width == 4)
+			knod_emit(priv, first, global_load_dword, data, bpf_reg64[p->base].lo, p->input_off + off);
+		else if (width == 2)
+			knod_emit(priv, first, global_load_ushort, data, bpf_reg64[p->base].lo, p->input_off + off);
+		else
+			knod_emit(priv, first, global_load_ubyte, data, bpf_reg64[p->base].lo, p->input_off + off);
+	}
+}
+
+static unsigned int knod_bpf_emit_packet_region(struct knod_bpf_priv *priv,
+					       struct knod_insn_meta *first)
+{
+	const struct knod_bpf_packet_region *p = &first->packet_region;
+	struct amdgcn_param32 data, byte, shift, zero;
+	struct amdgcn_param64 imm;
+	unsigned int off, width, n;
+	u8 packed[4] = {};
+
+	if (!p->count)
+		return 0;
+	if (first->map_region.producer) {
+		if (!first->map_region.staged ||
+		    first->map_region.producer->map_region.region != first) {
+			first->map_region.error = true;
+			return p->count;
+		}
+	} else {
+		knod_bpf_emit_region_inputs(priv, first, p);
+	}
+	/* Pack each output word's available prefix while packet reads run.
+	 * ENTRY and IMM values do not depend on those reads. Stop each word
+	 * at its first packet byte, retaining the partial word for completion.
+	 * A seven-byte input uses v29 for its pending byte tail: that aliases
+	 * the packing scratch, so retain the original schedule in that case.
+	 * No BPF register changes or packet stores occur before the wait.
+	 */
+	if (priv->isa_version == 10 && first->jit_engine == 1 &&
+	    p->input_bytes != 7) {
+		knod_vset32(&byte, KNOD_AMDGPU_TMP_VREG3_HI);
+		for (n = 0; n < p->bytes; n += 4) {
+			knod_vset32(&data, KNOD_AMDGPU_TMP_VREG0_LO + n / 4);
+			for (off = n; off < p->bytes && off < n + 4; off++) {
+				if (p->output[off].kind != KNOD_REGION_ENTRY &&
+				    p->output[off].kind != KNOD_REGION_IMM)
+					break;
+				if (!(off & 3)) {
+					knod_bpf_region_byte(priv, first, p, &p->output[off], data);
+				} else {
+					knod_bpf_region_byte(priv, first, p, &p->output[off], byte);
+					knod_iset32(&shift, (off & 3) * 8);
+					knod_emit(priv, first, v_lshl_or_b32,
+						  data, byte, shift, data);
+				}
+				packed[n / 4]++;
+			}
+		}
+	}
+	if (!first->map_region.producer)
+		knod_wait_vmcnt(priv, first);
+	if (p->input_bytes == 3 || p->input_bytes == 7) {
+		/* A 2+1 tail uses distinct read destinations until completion. */
+		knod_vset32(&data, KNOD_AMDGPU_TMP_VREG2_LO +
+			(p->input_bytes == 7));
+		knod_vset32(&byte, p->input_bytes == 3 ?
+			KNOD_AMDGPU_TMP_VREG2_LO + 1 : KNOD_AMDGPU_TMP_VREG3_HI);
+		knod_iset32(&shift, 16);
+		knod_lshlrev32(priv, first, byte, shift, byte);
+		knod_or32(priv, first, data, data, byte);
+	}
+	knod_iset32(&zero, 0);
+	knod_vset32(&byte, KNOD_AMDGPU_TMP_VREG3_HI);
+	for (off = 0; off < p->bytes; off++) {
+		if ((off & 3) < packed[off / 4])
+			continue;
+		knod_vset32(&data, KNOD_AMDGPU_TMP_VREG0_LO + off / 4);
+		if (!(off & 3)) {
+			knod_bpf_region_byte(priv, first, p, &p->output[off], data);
+		} else {
+			knod_bpf_region_byte(priv, first, p, &p->output[off], byte);
+			knod_iset32(&shift, (off & 3) * 8);
+			knod_emit(priv, first, v_lshl_or_b32,
+				  data, byte, shift, data);
+		}
+	}
+	/* Every entry-register input was packed before any BPF register is
+	 * changed. Final packet-loaded bytes come from protected input words.
+	 */
+	for (n = 0; n < 10; n++) {
+		if (!(p->changed & (1U << n)))
+			continue;
+		if (p->final[n].kind == KNOD_REGION_IMM) {
+			knod_iset64(&imm, p->final[n].imm);
+			knod_mov64(priv, first, bpf_reg64[n], imm);
+		} else {
+			knod_bpf_region_byte(priv, first, p, &p->final[n], bpf_reg64[n].lo);
+			knod_mov32(priv, first, bpf_reg64[n].hi, zero);
+		}
+	}
+	for (off = 0; off < p->bytes; off += width) {
+		width = knod_memory_chunk_width(p->bytes - off);
+		knod_vset32(&data, KNOD_AMDGPU_TMP_VREG0_LO + off / 4);
+		if (off & 3) {
+			knod_iset32(&shift, (off & 3) * 8);
+			knod_lshrrev32(priv, first, byte, shift, data);
+			data = byte;
+		}
+		knod_bpf_packet_store(priv, first, width, data, p->base, p->off + off);
+	}
+	return p->count;
+}
+
+/* Pure BPF proof. max_off is a target capability, not an opcode. Stores are
+ * delayed only across MOVs and other disjoint constant packet stores. */
+static void knod_bpf_conststore_group(struct knod_prog *prog,
+		struct knod_insn_meta *first, int max_off)
+{
+	struct knod_insn_meta *meta = first, *prev = NULL, *stores[16];
+	struct knod_bpf_conststore plan = {}, best = {};
+	u64 values[11] = {};
+	unsigned int known = 0, n = 0, best_n = 0, step;
+	int base = -1;
+
+	for (step = 0; step < 32; step++) {
+		const struct bpf_insn *i = &meta->insn;
+		unsigned int cls = BPF_CLASS(i->code);
+		u64 value;
+		int width, off, j, count, left;
+
+		if (meta->memory_group_owned || meta->conststore.elide ||
+		    meta->conststore.bytes || meta->bpf_insn_idx < 0 ||
+		    (prev && (meta->is_merge_point ||
+			(meta->flags & FLAG_INSN_IS_JUMP_DST) ||
+			meta->subprog_idx != first->subprog_idx ||
+			meta->bpf_insn_idx != prev->bpf_insn_idx + 1)))
+			break;
+		if (i->code == (BPF_ALU | BPF_MOV | BPF_K) ||
+		    i->code == (BPF_ALU64 | BPF_MOV | BPF_K) ||
+		    i->code == (BPF_ALU | BPF_MOV | BPF_X) ||
+		    i->code == (BPF_ALU64 | BPF_MOV | BPF_X)) {
+			if (i->off || i->dst_reg > 9 || i->dst_reg == base)
+				break;
+			if (BPF_SRC(i->code) == BPF_K) {
+				value = (u64)(s64)i->imm;
+			} else {
+				if (i->src_reg > 10)
+					break;
+				if (!(known & (1U << i->src_reg))) {
+					known &= ~(1U << i->dst_reg);
+					goto next;
+				}
+				value = values[i->src_reg];
+			}
+			values[i->dst_reg] = cls == BPF_ALU ? (u32)value : value;
+			known |= 1U << i->dst_reg;
+			goto next;
+		}
+		width = knod_bpf_packet_width(meta);
+		if (!width || (cls != BPF_ST && cls != BPF_STX) ||
+		    meta->percpu_rmw_add || i->dst_reg > 9 || n == 16)
+			break;
+		if (cls == BPF_ST)
+			value = (u64)(s64)i->imm;
+		else {
+			if (i->src_reg > 10 || !(known & (1U << i->src_reg)))
+				break;
+			value = values[i->src_reg];
+		}
+		if (base < 0) {
+			base = i->dst_reg;
+			plan.base = base;
+			plan.off = i->off;
+		}
+		if (base != i->dst_reg || plan.bytes + width > 16)
+			break;
+		off = i->off;
+		if (plan.bytes && off != plan.off + plan.bytes &&
+		    off + width != plan.off)
+			break;
+		if (off < plan.off) {
+			memmove(plan.data + width, plan.data, plan.bytes);
+			plan.off = off;
+		}
+		for (j = 0; j < width; j++)
+			plan.data[off - plan.off + j] = value >> (8 * j);
+		plan.bytes += width;
+		stores[n++] = meta;
+		for (count = 0, left = plan.bytes; left; count++)
+			left -= knod_memory_chunk_width(left);
+		if ((unsigned int)count < n && plan.off >= -max_off &&
+		    plan.off + plan.bytes - 1 < max_off) {
+			best = plan;
+			best_n = n;
+		}
+next:
+		if (list_is_last(&meta->l, &prog->insns))
+			break;
+		prev = meta;
+		meta = list_next_entry(meta, l);
+	}
+	if (!best_n)
+		return;
+	for (n = 0; n + 1 < best_n; n++)
+		stores[n]->conststore.elide = true;
+	stores[best_n - 1]->conststore = best;
+}
+
+static void knod_bpf_analyze_conststores(struct knod_bpf_priv *priv,
+		struct knod_prog *prog)
+{
+	struct knod_insn_meta *meta;
+	unsigned int remaining = 0;
+	int limit;
+
+	list_for_each_entry(meta, &prog->insns, l) {
+		memset(&meta->conststore, 0, sizeof(meta->conststore));
+		if (!remaining)
+			remaining = meta->packet_region.count ? meta->packet_region.count :
+				meta->loads.count ? meta->loads.count :
+				meta->copy.bytes ? 2 * meta->copy.bytes : meta->store.bytes;
+		meta->memory_group_owned = remaining != 0;
+		if (remaining)
+			remaining--;
+	}
+	if (priv->isa_version != 10 && priv->isa_version != 11)
+		return;
+	limit = priv->isa_version == 10 ? 2048 : 4096;
+	list_for_each_entry(meta, &prog->insns, l)
+		knod_bpf_conststore_group(prog, meta, limit);
+}
+
+static void knod_bpf_emit_conststore(struct knod_bpf_priv *priv,
+		struct knod_insn_meta *meta)
+{
+	const struct knod_bpf_conststore *p = &meta->conststore;
+	struct amdgcn_param32 data, imm;
+	int off, width, j, k, reg = KNOD_AMDGPU_TMP_VREG0_LO;
+
+	/* Distinct temporary words remain valid through every store. */
+	for (off = 0; off < p->bytes; off += width) {
+		width = knod_memory_chunk_width(p->bytes - off);
+		for (j = 0; j < width; j += 4) {
+			u32 value = 0;
+			for (k = 0; k < 4 && j + k < width; k++)
+				value |= (u32)p->data[off + j + k] << (8 * k);
+			knod_vset32(&data, reg + j / 4);
+			knod_iset32(&imm, value);
+			knod_mov32(priv, meta, data, imm);
+		}
+		knod_vset32(&data, reg);
+		knod_bpf_packet_store(priv, meta, width, data, p->base, p->off + off);
+		reg += (width + 3) / 4;
+	}
+}
+
+/* Move only a later adjacent dword store to an earlier dword store. Every
+ * other BPF instruction remains in place; no register value is kept cached.
+ */
+static bool knod_bpf_hoist_owned(const struct knod_insn_meta *m)
+{
+	return m->memory_group_owned || m->conststore.bytes ||
+		m->conststore.elide || m->store_hoist.emit || m->store_hoist.elide;
+}
+
+static void knod_bpf_analyze_store_hoist_group(struct knod_prog *prog,
+		struct knod_insn_meta *first, int limit)
+{
+	struct knod_insn_meta *meta = first, *prev;
+	struct { int off, width; } accesses[32];
+	unsigned int defs = 0, n = 0, step;
+	int base = first->insn.dst_reg, start = first->insn.off;
+
+	if (knod_bpf_hoist_owned(first) || first->percpu_rmw_add ||
+	    first->insn.code != (BPF_STX | BPF_MEM | BPF_W) ||
+	    first->ptr.type != PTR_TO_PACKET || base > 9 ||
+	    first->insn.src_reg > 10 || first->bpf_insn_idx < 0)
+		return;
+	for (step = 0; step < 32; step++) {
+		const struct bpf_insn *i;
+		struct knod_bpf_effect effect;
+		int width, lo, j;
+
+		if (list_is_last(&meta->l, &prog->insns))
+			return;
+		prev = meta;
+		meta = list_next_entry(meta, l);
+		i = &meta->insn;
+		if (knod_bpf_hoist_owned(meta) || meta->percpu_rmw_add ||
+		    meta->is_merge_point || (meta->flags & FLAG_INSN_IS_JUMP_DST) ||
+		    meta->subprog_idx != first->subprog_idx ||
+		    meta->bpf_insn_idx != prev->bpf_insn_idx + 1)
+			return;
+		effect = knod_bpf_effect(i);
+		if (effect.barrier || effect.terminal ||
+		    (effect.defs & (1U << base)))
+			return;
+		width = knod_bpf_packet_width(meta);
+		if (i->code == (BPF_STX | BPF_MEM | BPF_W) &&
+		    width == 4 && i->dst_reg == base && i->src_reg <= 10 &&
+		    !(defs & (1U << i->src_reg)) &&
+		    (i->off == start + 4 || i->off + 4 == start)) {
+			lo = min(start, (int)i->off);
+			if (lo < -limit || lo + 7 >= limit)
+				return;
+			for (j = 0; (unsigned int)j < n; j++)
+				if (i->off < accesses[j].off + accesses[j].width &&
+				    accesses[j].off < i->off + 4)
+					return;
+			first->store_hoist.off = lo;
+			first->store_hoist.base = base;
+			first->store_hoist.reg[0] = start == lo ?
+				first->insn.src_reg : i->src_reg;
+			first->store_hoist.reg[1] = start == lo ?
+				i->src_reg : first->insn.src_reg;
+			first->store_hoist.emit = true;
+			meta->store_hoist.elide = true;
+			return;
+		}
+		switch (BPF_CLASS(i->code)) {
+		case BPF_ALU:
+		case BPF_ALU64:
+			break;
+		case BPF_LDX:
+			if (BPF_MODE(i->code) != BPF_MEM)
+				return;
+			if (meta->ptr.type == PTR_TO_STACK)
+				break;
+			if (!width || i->src_reg != base)
+				return;
+			accesses[n].off = i->off;
+			accesses[n++].width = width;
+			break;
+		case BPF_ST:
+		case BPF_STX:
+			if (!width || i->dst_reg != base)
+				return;
+			accesses[n].off = i->off;
+			accesses[n++].width = width;
+			break;
+		default:
+			return;
+		}
+		defs |= effect.defs;
+	}
+}
+
+static void knod_bpf_analyze_store_hoists(struct knod_bpf_priv *priv,
+		struct knod_prog *prog)
+{
+	struct knod_insn_meta *meta;
+	int limit;
+
+	list_for_each_entry(meta, &prog->insns, l)
+		memset(&meta->store_hoist, 0, sizeof(meta->store_hoist));
+	if (priv->isa_version != 10 && priv->isa_version != 11)
+		return;
+	limit = priv->isa_version == 10 ? 2048 : 4096;
+	list_for_each_entry(meta, &prog->insns, l)
+		knod_bpf_analyze_store_hoist_group(prog, meta, limit);
+}
+
+static void knod_bpf_emit_store_hoist(struct knod_bpf_priv *priv,
+		struct knod_insn_meta *meta)
+{
+	struct amdgcn_param32 lo, hi;
+
+	knod_vset32(&lo, KNOD_AMDGPU_TMP_VREG0_LO);
+	knod_vset32(&hi, KNOD_AMDGPU_TMP_VREG0_HI);
+	knod_mov32(priv, meta, lo, bpf_reg64[meta->store_hoist.reg[0]].lo);
+	knod_mov32(priv, meta, hi, bpf_reg64[meta->store_hoist.reg[1]].lo);
+	knod_bpf_packet_store(priv, meta, 8, lo, meta->store_hoist.base, meta->store_hoist.off);
+}
+
+/* Exact selected-emission ledger; unknown forms terminate the region. */
+static bool knod_bpf_sink_transparent(struct knod_insn_meta *m)
+{
+	const struct bpf_insn *i = &m->insn;
+
+	if (m->percpu_rmw_add || m->loads.count || m->copy.bytes ||
+	    m->packet_region.count ||
+	    m->conststore.bytes || m->conststore.elide || m->store_hoist.elide)
+		return false;
+	if (m->store_hoist.emit)
+		return true; /* Existing emitter writes only v22/v23. */
+	if (m->memory_group_owned || m->store.bytes)
+		return false;
+	if (!i->off && (i->code == (BPF_ALU | BPF_MOV | BPF_K) ||
+	    i->code == (BPF_ALU64 | BPF_MOV | BPF_K) ||
+	    i->code == (BPF_ALU | BPF_MOV | BPF_X) ||
+	    i->code == (BPF_ALU64 | BPF_MOV | BPF_X)))
+		return true;
+	if (i->code == (BPF_ALU64 | BPF_ADD | BPF_K))
+		return true; /* r64[0] = v22/v23. */
+	if (i->code == (BPF_ALU | BPF_END | BPF_TO_BE) &&
+	    (i->imm == 16 || i->imm == 32))
+		return true; /* BPF destination and scalar selector only. */
+	return (i->code == (BPF_LDX | BPF_MEM | BPF_W) ||
+		i->code == (BPF_LDX | BPF_MEM | BPF_DW)) &&
+		m->ptr.type == PTR_TO_STACK &&
+		!((m->sreg.stack_off + i->off) & 3);
+}
+
+static bool knod_bpf_sink_store(struct knod_insn_meta *m)
+{
+	return !m->percpu_rmw_add && !m->store_hoist.emit &&
+		!m->store_hoist.elide && !m->conststore.bytes &&
+		!m->conststore.elide && !m->packet_region.count &&
+		!m->copy.bytes && !m->loads.count &&
+		m->ptr.type == PTR_TO_PACKET &&
+		(m->insn.code == (BPF_STX | BPF_MEM | BPF_B) ||
+		 m->insn.code == (BPF_STX | BPF_MEM | BPF_H) ||
+		 m->insn.code == (BPF_STX | BPF_MEM | BPF_W));
+}
+
+/* BPF versions and byte provenance are independent of physical registers.
+ * The accepted target ledger reserves at most two words, v26/v27, later.
+ */
+static void knod_bpf_sink_group(struct knod_prog *prog,
+		struct knod_insn_meta *first, int limit)
+{
+	struct knod_insn_meta *m = first, *prev = NULL, *stores[16];
+	unsigned short version[11] = {}, stored_version[16];
+	int offsets[16], widths[16], regs[16], costs = 0, group_left = 0;
+	int n = 0, step, base = first->insn.dst_reg, lo = SHRT_MAX, hi = SHRT_MIN;
+	int disjoint_off[32], disjoint_n = 0;
+
+	if (!knod_bpf_sink_store(first) || first->sink.member || base > 9)
+		return;
+	for (step = 0; step < 32; step++) {
+		struct knod_bpf_effect effect;
+		int width, j, k, covered = 0, chunks = 0, left;
+		struct knod_bpf_sink plan = {};
+		int capture_reg[2], capture_version[2], capture_at[2], captures = 0;
+
+		if (m->sink.member || m->bpf_insn_idx < 0 ||
+		    (prev && (m->is_merge_point || (m->flags & FLAG_INSN_IS_JUMP_DST) ||
+			m->subprog_idx != first->subprog_idx ||
+			m->bpf_insn_idx != prev->bpf_insn_idx + 1)))
+			return;
+		effect = knod_bpf_effect(&m->insn);
+		if (effect.barrier || effect.terminal || (effect.defs & (1U << base)))
+			return;
+		if (knod_bpf_sink_store(m)) {
+			if (m->insn.dst_reg != base || n == 16 || m->insn.src_reg > 10)
+				return;
+			if (m->store.bytes)
+				group_left = m->store.bytes;
+			if (m->memory_group_owned && !group_left)
+				return; /* Never enter an existing group's interior. */
+			if (!m->memory_group_owned || m->store.bytes)
+				costs++;
+			if (group_left)
+				group_left--;
+			width = knod_bpf_packet_width(m);
+			for (j = 0; j < n; j++)
+				if (m->insn.off < offsets[j] + widths[j] &&
+				    offsets[j] < m->insn.off + width)
+					return;
+			stores[n] = m;
+			offsets[n] = m->insn.off;
+			widths[n] = width;
+			regs[n] = m->insn.src_reg;
+			stored_version[n++] = version[m->insn.src_reg];
+			lo = min(lo, (int)m->insn.off);
+			hi = max(hi, (int)m->insn.off + width);
+			if (hi - lo > 16)
+				return;
+		} else {
+			if (group_left || !knod_bpf_sink_transparent(m))
+				return;
+			if (m->store_hoist.emit) {
+				if (m->store_hoist.base != base)
+					return;
+				disjoint_off[disjoint_n++] = m->store_hoist.off;
+			}
+			for (j = 0; j < 11; j++)
+				if (effect.defs & (1U << j))
+					version[j]++;
+		}
+		for (j = 0; j < disjoint_n; j++)
+			if (disjoint_off[j] < hi && lo < disjoint_off[j] + 8)
+				return;
+		for (j = 0; j < n; j++)
+			covered += widths[j];
+		for (left = hi - lo; left > 0; chunks++)
+			left -= knod_memory_chunk_width(left);
+		/* Commit the first profitable complete group. No future speculation. */
+		if (n > 1 && !group_left && covered == hi - lo && chunks < costs &&
+		    lo >= -limit && hi - 1 < limit && knod_bpf_sink_store(m)) {
+			plan.off = lo;
+			plan.bytes = hi - lo;
+			plan.base = base;
+			for (j = 0; j < n; j++) {
+				int source = regs[j];
+				bool saved = stored_version[j] != version[regs[j]];
+				if (saved) {
+					for (k = 0; k < captures; k++)
+						if (capture_reg[k] == regs[j] &&
+						    capture_version[k] == stored_version[j])
+							break;
+					if (k == captures) {
+						if (captures == 2)
+							return;
+						capture_reg[k] = regs[j];
+						capture_version[k] = stored_version[j];
+						capture_at[k] = j;
+						captures++;
+					}
+					source = k;
+				}
+				for (k = 0; k < widths[j]; k++) {
+					int b = offsets[j] - lo + k;
+					plan.value[b].source = source;
+					plan.value[b].saved = saved;
+					plan.value[b].shift = 8 * k;
+				}
+			}
+			for (j = 0; j < n; j++) {
+				stores[j]->sink.member = true;
+				memset(&stores[j]->store, 0, sizeof(stores[j]->store));
+				stores[j]->memory_group_owned = false;
+			}
+			plan.member = true;
+			m->sink = plan;
+			for (j = 0; j < captures; j++) {
+				stores[capture_at[j]]->sink.capture = j + 1;
+				stores[capture_at[j]]->sink.capture_reg = capture_reg[j];
+			}
+			return;
+		}
+		if (list_is_last(&m->l, &prog->insns))
+			return;
+		prev = m;
+		m = list_next_entry(m, l);
+	}
+}
+
+/* Forward only the immediately following scalar read. Captured versions
+ * survive the sink emitter; no intervening target instruction is admitted.
+ */
+static void knod_bpf_sink_forward(struct knod_prog *prog,
+		struct knod_insn_meta *m)
+{
+	struct knod_insn_meta *n;
+	int width, delta, j;
+
+	if (!m->sink.bytes || m->sink.forward || list_is_last(&m->l, &prog->insns))
+		return;
+	n = list_next_entry(m, l);
+	if (n->sink.member || n->memory_group_owned || n->packet_imm_valid ||
+	    n->percpu_rmw_add || n->loads.count || n->copy.bytes ||
+	    n->packet_region.count || n->conststore.bytes || n->conststore.elide ||
+	    n->store_hoist.emit || n->store_hoist.elide || n->store.bytes ||
+	    n->is_merge_point || (n->flags & FLAG_INSN_IS_JUMP_DST) ||
+	    n->subprog_idx != m->subprog_idx || n->bpf_insn_idx != m->bpf_insn_idx + 1 ||
+	    n->ptr.type != PTR_TO_PACKET || n->insn.src_reg != m->sink.base ||
+	    n->insn.dst_reg > 9)
+		return;
+	switch (n->insn.code) {
+	case BPF_LDX | BPF_MEM | BPF_B: width = 1; break;
+	case BPF_LDX | BPF_MEM | BPF_H: width = 2; break;
+	case BPF_LDX | BPF_MEM | BPF_W: width = 4; break;
+	default: return;
+	}
+	delta = n->insn.off - m->sink.off;
+	if (delta < 0 || delta + width > m->sink.bytes)
+		return;
+	n->sink.member = n->sink.forward = true;
+	n->sink.bytes = width;
+	for (j = 0; j < width; j++)
+		n->sink.value[j] = m->sink.value[delta + j];
+}
+
+static void knod_bpf_analyze_sinks(struct knod_bpf_priv *priv, struct knod_prog *prog)
+{
+	struct knod_insn_meta *m;
+	list_for_each_entry(m, &prog->insns, l)
+		memset(&m->sink, 0, sizeof(m->sink));
+	if (priv->isa_version != 10)
+		return; /* Audited native selected forms on the active GFX10 path. */
+	list_for_each_entry(m, &prog->insns, l)
+		knod_bpf_sink_group(prog, m, 2048);
+	list_for_each_entry(m, &prog->insns, l)
+		knod_bpf_sink_forward(prog, m);
+}
+
+static void knod_bpf_emit_sink(struct knod_bpf_priv *priv, struct knod_insn_meta *m)
+{
+	struct amdgcn_param32 dst, src, shift, bits, tmp;
+	int off, width, j;
+
+	if (m->sink.capture) {
+		knod_vset32(&dst, KNOD_AMDGPU_TMP_VREG2_LO + m->sink.capture - 1);
+		knod_mov32(priv, m, dst, bpf_reg64[m->sink.capture_reg].lo);
+	}
+	knod_iset32(&bits, 8);
+	knod_vset32(&tmp, KNOD_AMDGPU_TMP_VREG3_HI);
+	for (off = 0; off < m->sink.bytes; off += width) {
+		width = knod_memory_chunk_width(m->sink.bytes - off);
+		for (j = 0; j < width;) {
+			const struct knod_bpf_sink_value *v = &m->sink.value[off + j];
+			int run = 1;
+
+			/* Coalesce byte provenance only within one output word and
+			 * one original 32-bit source version. Source registers never
+			 * overlap the v22..25 output packing bank or v29 scratch.
+			 */
+			while (j + run < width && (j % 4) + run < 4 &&
+			       v->shift + run * 8 < 32) {
+				const struct knod_bpf_sink_value *next =
+					&m->sink.value[off + j + run];
+
+				if (next->saved != v->saved || next->source != v->source ||
+				    next->shift != v->shift + run * 8)
+					break;
+				run++;
+			}
+			knod_vset32(&dst, KNOD_AMDGPU_TMP_VREG0_LO + j / 4);
+			if (v->saved)
+				knod_vset32(&src, KNOD_AMDGPU_TMP_VREG2_LO + v->source);
+			else
+				src = bpf_reg64[v->source].lo;
+			if (run == 4) {
+				knod_mov32(priv, m, dst, src);
+			} else {
+				knod_iset32(&shift, v->shift);
+				knod_iset32(&bits, run * 8);
+				knod_bfe32(priv, m, j % 4 ? tmp : dst, src, shift, bits);
+				if (j % 4) {
+					knod_iset32(&shift, (j % 4) * 8);
+					knod_emit(priv, m, v_lshl_or_b32, dst, tmp, shift, dst);
+				}
+			}
+			j += run;
+		}
+		knod_vset32(&dst, KNOD_AMDGPU_TMP_VREG0_LO);
+		if (m->sink.forward) {
+			knod_mov32(priv, m, bpf_reg64[m->insn.dst_reg].lo, dst);
+			knod_iset32(&tmp, 0);
+			knod_mov32(priv, m, bpf_reg64[m->insn.dst_reg].hi, tmp);
+			return;
+		}
+		knod_bpf_packet_store(priv, m, width, dst, m->sink.base, m->sink.off + off);
+	}
+}
+
+/* Consume the target-independent proof. Unsupported targets keep every
+ * original instruction. The caller skips members only after successful emit.
+ */
+static unsigned int knod_bpf_emit_copy(struct knod_bpf_priv *priv,
+				      struct knod_insn_meta *first)
+{
+	const struct knod_bpf_copy *copy = &first->copy;
+	struct amdgcn_param32 data, word, shift, bits, zero;
+	int base = copy->base_reg, tmp = copy->value_reg;
+	int best = copy->bytes, start = copy->src_off;
+	int delta = copy->dst_off - start, last = start + copy->last_byte;
+	struct { int off, width, reg; } chunks[3];
+	int off, width, pos, offset_limit, n = 0, i;
+	int next_reg = KNOD_AMDGPU_TMP_VREG0_LO;
+
+	if (!best || (priv->isa_version != 10 && priv->isa_version != 11))
+		return 0;
+	/* GLOBAL immediate offsets are narrower than BPF's s16. Do not
+	 * truncate an address; retain ordinary lowering outside this range.
+	 */
+	offset_limit = priv->isa_version == 10 ? 2048 : 4096;
+	if (start < -offset_limit || start + best - 1 >= offset_limit ||
+	    copy->dst_off < -offset_limit ||
+	    copy->dst_off + best - 1 >= offset_limit)
+		return 0;
+
+	/* Each load owns separate temporary VGPRs until its store. At most
+	 * five are needed: 15 bytes split as 12+2+1 uses 3+1+1 registers
+	 * (v22..v26), all inside the ABI temporary area. No helper intervenes.
+	 * The proof covers the whole group, so loads can precede all stores.
+	 * GFX10/11 queues enable UNALIGNED before any program is submitted.
+	 */
+	knod_iset32(&zero, 0);
+	knod_iset32(&bits, 8);
+	for (off = 0; off < best; off += width) {
+		width = best - off >= 16 ? 16 : best - off >= 12 ? 12 :
+			best - off >= 8 ? 8 : 1 << ilog2(best - off);
+		chunks[n].off = off;
+		chunks[n].width = width;
+		chunks[n++].reg = next_reg;
+		knod_vset32(&data, next_reg);
+		next_reg += (width + 3) / 4;
+		switch (width) {
+		case 16:
+			knod_emit(priv, first, global_load_dwordx4, data,
+				  bpf_reg64[base].lo, start + off);
+			break;
+		case 12:
+			knod_emit(priv, first, global_load_dwordx3, data,
+				  bpf_reg64[base].lo, start + off);
+			break;
+		case 8:
+			knod_emit(priv, first, global_load_dwordx2, data,
+				  bpf_reg64[base].lo, start + off);
+			break;
+		case 4:
+			knod_emit(priv, first, global_load_dword, data,
+				  bpf_reg64[base].lo, start + off);
+			break;
+		case 2:
+			knod_emit(priv, first, global_load_ushort, data,
+				  bpf_reg64[base].lo, start + off);
+			break;
+		default:
+			knod_emit(priv, first, global_load_ubyte, data,
+				  bpf_reg64[base].lo, start + off);
+		}
+	}
+	/* Every following consumer sees completed loads. Keep group boundaries
+	 * intact; the next group may depend on stores from this one.
+	 */
+	knod_wait_vmcnt(priv, first);
+	for (i = 0; i < n; i++) {
+		off = chunks[i].off;
+		width = chunks[i].width;
+		knod_vset32(&data, chunks[i].reg);
+		/* A byte load leaves its zero-extended value in the BPF temporary,
+		 * even when that register remains live after the copy sequence.
+		 */
+		pos = last - start - off;
+		if (pos >= 0 && pos < width) {
+			knod_vset32(&word, data.v + pos / 4);
+			knod_iset32(&shift, (pos % 4) * 8);
+			knod_bfe32(priv, first, bpf_reg64[tmp].lo, word,
+				   shift, bits);
+			knod_mov32(priv, first, bpf_reg64[tmp].hi, zero);
+		}
+		switch (width) {
+		case 16:
+			knod_emit(priv, first, global_store_dwordx4, data,
+				  bpf_reg64[base].lo, start + delta + off);
+			break;
+		case 12:
+			knod_emit(priv, first, global_store_dwordx3, data,
+				  bpf_reg64[base].lo, start + delta + off);
+			break;
+		case 8:
+			knod_emit(priv, first, global_store_dwordx2, data,
+				  bpf_reg64[base].lo, start + delta + off);
+			break;
+		case 4:
+			knod_emit(priv, first, global_store_dword, data,
+				  bpf_reg64[base].lo, start + delta + off);
+			break;
+		case 2:
+			knod_emit(priv, first, global_store_short, data,
+				  bpf_reg64[base].lo, start + delta + off);
+			break;
+		default:
+			knod_emit(priv, first, global_store_byte, data,
+				  bpf_reg64[base].lo, start + delta + off);
+		}
+	}
+	return 2 * best;
+}
+
+/* Pack each source's low byte without modifying any BPF register. Distinct
+ * temporary words stay intact through all stores; no load wait is needed.
+ */
+static unsigned int knod_bpf_emit_store(struct knod_bpf_priv *priv,
+				       struct knod_insn_meta *first)
+{
+	const struct knod_bpf_store *store = &first->store;
+	struct amdgcn_param32 data, byte, zero, bits, shift;
+	struct { int off, width, reg; } chunks[3];
+	int off, width, j, i, n = 0, limit;
+	int next_reg = KNOD_AMDGPU_TMP_VREG0_LO;
+
+	if (!store->bytes ||
+	    (priv->isa_version != 10 && priv->isa_version != 11))
+		return 0;
+	limit = priv->isa_version == 10 ? 2048 : 4096;
+	if (store->off < -limit || store->off + store->bytes - 1 >= limit)
+		return 0;
+	knod_vset32(&byte, KNOD_AMDGPU_TMP_VREG3_HI);
+	knod_iset32(&zero, 0);
+	knod_iset32(&bits, 8);
+	for (off = 0; off < store->bytes; off += width) {
+		width = store->bytes - off >= 16 ? 16 :
+			store->bytes - off >= 12 ? 12 :
+			store->bytes - off >= 8 ? 8 :
+			1 << ilog2(store->bytes - off);
+		chunks[n].off = off;
+		chunks[n].width = width;
+		chunks[n++].reg = next_reg;
+		for (j = 0; j < width; j++) {
+			knod_vset32(&data, next_reg + j / 4);
+			if (!(j % 4)) {
+				knod_bfe32(priv, first, data,
+					   bpf_reg64[store->value_reg[off + j]].lo,
+					   zero, bits);
+			} else {
+				knod_bfe32(priv, first, byte,
+					   bpf_reg64[store->value_reg[off + j]].lo,
+					   zero, bits);
+				knod_iset32(&shift, (j % 4) * 8);
+				knod_emit(priv, first, v_lshl_or_b32,
+					  data, byte, shift, data);
+			}
+		}
+		next_reg += (width + 3) / 4;
+	}
+	/* Up to five packed words (15B = 12+2+1) use v22..v26;
+	 * the byte temporary v29 is disjoint and inside the existing ABI.
+	 */
+	for (i = 0; i < n; i++) {
+		knod_vset32(&data, chunks[i].reg);
+		off = store->off + chunks[i].off;
+		switch (chunks[i].width) {
+		case 16:
+			knod_emit(priv, first, global_store_dwordx4, data,
+				  bpf_reg64[store->base_reg].lo, off);
+			break;
+		case 12:
+			knod_emit(priv, first, global_store_dwordx3, data,
+				  bpf_reg64[store->base_reg].lo, off);
+			break;
+		case 8:
+			knod_emit(priv, first, global_store_dwordx2, data,
+				  bpf_reg64[store->base_reg].lo, off);
+			break;
+		case 4:
+			knod_emit(priv, first, global_store_dword, data,
+				  bpf_reg64[store->base_reg].lo, off);
+			break;
+		case 2:
+			knod_emit(priv, first, global_store_short, data,
+				  bpf_reg64[store->base_reg].lo, off);
+			break;
+		default:
+			knod_emit(priv, first, global_store_byte, data,
+				  bpf_reg64[store->base_reg].lo, off);
+		}
+	}
+	return store->bytes;
+}
+
+static unsigned int knod_bpf_emit_loads(struct knod_bpf_priv *priv,
+					struct knod_insn_meta *first)
+{
+	const struct knod_memory_load_group *g = &first->loads;
+	struct amdgcn_param32 data, word, tmp, shift, bits, zero, dst;
+	unsigned char byte_reg[16], byte_shift[16];
+	unsigned int off, width, j, i, k, take, pos, out;
+	int next = KNOD_AMDGPU_TMP_VREG0_LO, limit;
+	if (!g->count || (priv->isa_version != 10 && priv->isa_version != 11))
+		return 0;
+	limit = priv->isa_version == 10 ? 2048 : 4096;
+	if (g->off < -limit || g->off + g->bytes - 1 >= limit)
+		return 0;
+	/* At most five load words (15B = 12+2+1), plus scatter v29. */
+	for (off = 0; off < g->bytes; off += width) {
+		width = knod_memory_chunk_width(g->bytes - off);
+		knod_vset32(&data, next);
+		for (j = 0; j < width; j++) {
+			byte_reg[off + j] = next + j / 4;
+			byte_shift[off + j] = (j % 4) * 8;
+		}
+		switch (width) {
+		case 16:
+			knod_emit(priv, first, global_load_dwordx4, data,
+				  bpf_reg64[g->base].lo, g->off + off);
+			break;
+		case 12:
+			knod_emit(priv, first, global_load_dwordx3, data,
+				  bpf_reg64[g->base].lo, g->off + off);
+			break;
+		case 8:
+			knod_emit(priv, first, global_load_dwordx2, data,
+				  bpf_reg64[g->base].lo, g->off + off);
+			break;
+		case 4:
+			knod_emit(priv, first, global_load_dword, data,
+				  bpf_reg64[g->base].lo, g->off + off);
+			break;
+		case 2:
+			knod_emit(priv, first, global_load_ushort, data,
+				  bpf_reg64[g->base].lo, g->off + off);
+			break;
+		case 1:
+			knod_emit(priv, first, global_load_ubyte, data,
+				  bpf_reg64[g->base].lo, g->off + off);
+			break;
+		}
+		next += (width + 3) / 4;
+	}
+	knod_wait_vmcnt(priv, first);
+	knod_iset32(&zero, 0);
+	knod_vset32(&tmp, KNOD_AMDGPU_TMP_VREG3_HI);
+	for (i = 0; i < g->count; i++) {
+		for (k = 0; k < g->member[i].width; k += 4) {
+			dst = k ? bpf_reg64[g->member[i].dst].hi
+				: bpf_reg64[g->member[i].dst].lo;
+			out = 0;
+			for (j = k; j < g->member[i].width && j < k + 4;
+			     j += take) {
+				pos = g->member[i].off + j;
+				take = min_t(
+				    unsigned int, 4 - byte_shift[pos] / 8,
+				    min_t(unsigned int, g->member[i].width - j,
+					  k + 4 - j));
+				/* A short final chunk may occupy fewer bytes
+				 * than its VGPR. */
+				while (take > 1 && byte_reg[pos + take - 1] !=
+						       byte_reg[pos])
+					take--;
+				knod_vset32(&word, byte_reg[pos]);
+				if (take == 4) {
+					knod_mov32(priv, first, dst, word);
+				} else {
+					knod_iset32(&shift, byte_shift[pos]);
+					knod_iset32(&bits, take * 8);
+					knod_bfe32(priv, first, out ? tmp : dst,
+						   word, shift, bits);
+					if (out) {
+						knod_iset32(&shift, out * 8);
+						knod_emit(priv, first,
+							  v_lshl_or_b32, dst,
+							  tmp, shift, dst);
+					}
+				}
+				out += take;
+			}
+		}
+		if (g->member[i].width < 8)
+			knod_mov32(priv, first, bpf_reg64[g->member[i].dst].hi,
+				   zero);
+	}
+	return g->count;
+}
+/* Exact three-instruction pair: no speculative bytes or intervening CFG. */
+static bool knod_bpf_load_pair_free(struct knod_insn_meta *m)
+{
+	return !m->map_region.region && !m->map_region.producer &&
+	       !m->map_lds_head && !m->map_lds_tail && !m->wide_read.owned && !m->map_widen.owned && !m->read_batch.owned && !m->percpu_dead && !m->load_pair.owned && !m->sink.member && !m->memory_group_owned &&
+		!m->packet_imm_valid && !m->percpu_rmw_add && !m->loads.count &&
+		!m->copy.bytes && !m->store.bytes && !m->packet_region.count &&
+		!m->conststore.bytes && !m->conststore.elide &&
+		!m->store_hoist.emit && !m->store_hoist.elide;
+}
+
+/* Two independent loads retain issue order and meet at the LDS tail wait. */
+static bool knod_bpf_map_lds_pair(struct knod_insn_meta *a,
+				  struct knod_insn_meta *b)
+{
+	int width, off;
+	struct knod_local_effect effects[2] = {0};
+
+	if (a->jit_engine != 1 || b->jit_engine != 1 ||
+	    a->map_lds_head || a->map_lds_tail ||
+	    b->map_lds_head || b->map_lds_tail ||
+	    !knod_bpf_load_pair_free(a) || !knod_bpf_load_pair_free(b) ||
+	    a->sr.owner || b->sr.owner || a->is_merge_point || b->is_merge_point ||
+	    ((a->flags | b->flags) & FLAG_INSN_IS_JUMP_DST) ||
+	    a->bpf_insn_idx < 0 || b->bpf_insn_idx != a->bpf_insn_idx + 1 ||
+	    a->subprog_idx != b->subprog_idx ||
+	    a->insn.code != (BPF_LDX | BPF_MEM | BPF_W) ||
+	    a->ptr.type != PTR_TO_MAP_VALUE || a->insn.imm || b->insn.imm ||
+	    a->insn.dst_reg > 9 || a->insn.src_reg > 9 ||
+	    b->insn.dst_reg > 9 || b->insn.src_reg > 10 ||
+	    b->ptr.type != PTR_TO_STACK)
+		return false;
+	switch (b->insn.code) {
+	case BPF_LDX | BPF_MEM | BPF_B: width = 1; break;
+	case BPF_LDX | BPF_MEM | BPF_H: width = 2; break;
+	case BPF_LDX | BPF_MEM | BPF_W: width = 4; break;
+	case BPF_LDX | BPF_MEM | BPF_DW: width = 8; break;
+	default: return false;
+	}
+	off = b->sreg.stack_off + b->insn.off;
+	if (off < -512 || off > -width || (off & (width - 1)))
+		return false;
+	effects[0].reg = knod_bpf_effect(&a->insn);
+	effects[1].reg = knod_bpf_effect(&b->insn);
+	effects[0].read = effects[1].read = true;
+	effects[0].space = KNOD_MEMORY_SHARED_MAP;
+	effects[1].space = KNOD_MEMORY_PRIVATE_STACK;
+	if (!knod_local_batch_reads(&effects[0], &effects[1]))
+		return false;
+
+	a->map_lds_head = true;
+	b->map_lds_tail = true;
+	return true;
+}
+
+static void knod_bpf_analyze_map_lds(struct knod_bpf_priv *priv,
+				     struct knod_prog *prog)
+{
+	struct knod_insn_meta *m;
+
+	list_for_each_entry(m, &prog->insns, l) {
+		m->map_lds_head = false;
+		m->map_lds_tail = false;
+	}
+	if (priv->isa_version != 10)
+		return;
+	list_for_each_entry(m, &prog->insns, l) {
+		if (!list_is_last(&m->l, &prog->insns))
+			knod_bpf_map_lds_pair(m, list_next_entry(m, l));
+	}
+}
+
+/* Consecutive ordinary map byte loads only. Exact bytes, no speculative gap. */
+static void knod_bpf_analyze_map_widen(struct knod_bpf_priv *priv,
+				      struct knod_prog *prog)
+{
+	struct knod_insn_meta *first, *m, *nodes[8];
+	unsigned int n, i;
+
+	list_for_each_entry(m, &prog->insns, l)
+		memset(&m->map_widen, 0, sizeof(m->map_widen));
+	if (priv->isa_version != 10)
+		return;
+	list_for_each_entry(first, &prog->insns, l) {
+		int base = first->insn.src_reg;
+
+		m = first;
+		for (n = 0; n < ARRAY_SIZE(nodes); n++) {
+			if (!knod_bpf_load_pair_free(m) || m->map_widen.owned ||
+			    m->insn.code != (BPF_LDX | BPF_MEM | BPF_B) ||
+			    m->insn.imm || m->ptr.type != PTR_TO_MAP_VALUE ||
+			    base > 9 || m->insn.src_reg != base ||
+			    m->insn.dst_reg > 9 || first->bpf_insn_idx < 0 ||
+			    m->bpf_insn_idx != first->bpf_insn_idx + n ||
+			    m->subprog_idx != first->subprog_idx ||
+			    m->insn.off != first->insn.off + (int)n ||
+			    m->insn.off < -2048 || m->insn.off >= 2048 ||
+			    (n && (m->is_merge_point ||
+				   (m->flags & FLAG_INSN_IS_JUMP_DST))))
+				break;
+			nodes[n] = m;
+			if (m->insn.dst_reg == base ||
+			    list_is_last(&m->l, &prog->insns)) {
+				n++;
+				break;
+			}
+			m = list_next_entry(m, l);
+		}
+		if (n < 2)
+			continue;
+		first->map_widen.count = n;
+		for (i = 0; i < n; i++) {
+			first->map_widen.dst[i] = nodes[i]->insn.dst_reg;
+			nodes[i]->map_widen.owned = true;
+		}
+	}
+}
+
+static void knod_bpf_emit_map_widen(struct knod_bpf_priv *priv,
+				   struct knod_insn_meta *first)
+{
+	struct amdgcn_param32 data, shift, bits, zero;
+	unsigned int i = 0, width, slot = 0, j, n = first->map_widen.count;
+	u8 source[8], shifts[8];
+
+	if (!n)
+		return;
+	if (first->map_region.region &&
+	    (first->map_region.region->map_region.producer != first ||
+	     first->map_region.region->map_region.staged)) {
+		first->map_region.error = true;
+		return;
+	}
+	while (i < n) {
+		width = n - i >= 4 ? 4 : n - i >= 2 ? 2 : 1;
+		/* Keep every exact tail in its own staging word. */
+		for (j = 0; j < width; j++) {
+			source[i + j] = slot;
+			shifts[i + j] = 8 * j;
+		}
+		knod_vset32(&data, KNOD_AMDGPU_TMP_VREG0_LO + slot++);
+		switch (width) {
+		case 4:
+			knod_emit(priv, first, global_load_dword, data,
+				  bpf_reg64[first->insn.src_reg].lo, first->insn.off + i);
+			break;
+		case 2:
+			knod_emit(priv, first, global_load_ushort, data,
+				  bpf_reg64[first->insn.src_reg].lo, first->insn.off + i);
+			break;
+		default:
+			knod_emit(priv, first, global_load_ubyte, data,
+				  bpf_reg64[first->insn.src_reg].lo, first->insn.off + i);
+			break;
+		}
+		i += width;
+	}
+	if (first->map_region.region)
+		knod_bpf_emit_region_inputs(priv, first,
+			&first->map_region.region->packet_region);
+	knod_wait_vmcnt(priv, first);
+	if (first->map_region.region)
+		first->map_region.region->map_region.staged = true;
+	knod_iset32(&bits, 8);
+	knod_iset32(&zero, 0);
+	for (i = 0; i < n; i++) {
+		knod_vset32(&data, KNOD_AMDGPU_TMP_VREG0_LO + source[i]);
+		knod_iset32(&shift, shifts[i]);
+		knod_bfe32(priv, first, bpf_reg64[first->map_widen.dst[i]].lo,
+			   data, shift, bits);
+		knod_mov32(priv, first, bpf_reg64[first->map_widen.dst[i]].hi, zero);
+	}
+}
+
+/* Compose selected groups only after every owner has been assigned. */
+static bool knod_bpf_map_region_other_owner(struct knod_insn_meta *m, bool packet_owner)
+{
+	return m->map_lds_head || m->map_lds_tail || m->wide_read.owned || m->read_batch.owned || m->load_pair.owned ||
+	       m->percpu_dead || m->percpu_rmw_add ||
+	       (m->memory_group_owned && !packet_owner) ||
+	       m->loads.count || m->copy.bytes || m->store.bytes ||
+	       m->packet_imm_valid || m->conststore.bytes || m->conststore.elide ||
+	       m->store_hoist.emit || m->store_hoist.elide || m->sink.member;
+}
+
+static void knod_bpf_analyze_map_regions(struct knod_bpf_priv *priv,
+				       struct knod_prog *prog)
+{
+	struct knod_insn_meta *first, *m, *region;
+	unsigned int i, defs, count;
+
+	list_for_each_entry(m, &prog->insns, l)
+		memset(&m->map_region, 0, sizeof(m->map_region));
+	if (priv->isa_version != 10 || prog->jit_engine != 1)
+		return;
+	list_for_each_entry(first, &prog->insns, l) {
+		count = first->map_widen.count;
+		if (count < 2 || count > 8 || !first->map_widen.owned ||
+		    first->bpf_insn_idx < 0 || first->jit_engine != 1 ||
+		    first->insn.src_reg > 9)
+			continue;
+		defs = 0;
+		m = first;
+		for (i = 0; i < count; i++) {
+			if (!m->map_widen.owned || m->packet_region.count ||
+			    knod_bpf_map_region_other_owner(m, false) || m->sr.owner ||
+			    m->jit_engine != 1 || (m->flags & FLAG_INSN_IS_SUBPROG_START) ||
+			    m->subprog_idx != first->subprog_idx ||
+			    m->bpf_insn_idx != first->bpf_insn_idx + (int)i ||
+			    (i && (m->is_merge_point || (m->flags & FLAG_INSN_IS_JUMP_DST))) ||
+			    m->insn.code != (BPF_LDX | BPF_MEM | BPF_B) ||
+			    m->ptr.type != PTR_TO_MAP_VALUE || m->insn.imm ||
+			    m->insn.dst_reg > 9 || m->insn.src_reg != first->insn.src_reg ||
+			    (i + 1 < count && m->insn.dst_reg == m->insn.src_reg) ||
+			    m->insn.off != first->insn.off + (int)i ||
+			    first->map_widen.dst[i] != m->insn.dst_reg ||
+			    list_is_last(&m->l, &prog->insns))
+				break;
+			defs |= 1U << m->insn.dst_reg;
+			m = list_next_entry(m, l);
+		}
+		if (i != count)
+			continue;
+		region = m;
+		if (!region->packet_region.count || region->packet_region.base > 9 ||
+		    !region->packet_region.input_bytes || region->packet_region.input_bytes > 8 ||
+		    region->packet_region.input_bytes == 7 ||
+		    !region->packet_region.bytes || region->packet_region.bytes > 16 ||
+		    region->jit_engine != 1 || region->is_merge_point ||
+		    (region->flags & (FLAG_INSN_IS_JUMP_DST | FLAG_INSN_IS_SUBPROG_START)) ||
+		    region->subprog_idx != first->subprog_idx ||
+		    region->bpf_insn_idx != first->bpf_insn_idx + (int)count ||
+		    (defs & (1U << region->packet_region.base)) ||
+		    region->map_widen.owned || knod_bpf_map_region_other_owner(region, true) ||
+		    (region->sr.owner && region->sr.owner != region) ||
+		    first->map_region.region || region->map_region.producer)
+			continue;
+		/* Commit both directions only after the complete proof. */
+		first->map_region.region = region;
+		region->map_region.producer = first;
+	}
+}
+
+#define KNOD_READ_BATCH_BASE (KNOD_AMDGPU_TMP_VREG3_HI + 1)
+
+static unsigned int knod_bpf_read_batch_width(const struct bpf_insn *insn,
+					     bool load)
+{
+	unsigned int cls = load ? BPF_LDX : BPF_STX;
+
+	if (insn->code == (cls | BPF_MEM | BPF_B))
+		return 1;
+	if (insn->code == (cls | BPF_MEM | BPF_H))
+		return 2;
+	if (insn->code == (cls | BPF_MEM | BPF_W))
+		return 4;
+	return 0;
+}
+
+/* Only unconditional exact packet reads and private aligned LDS stores.
+ * Publish ownership after all checks; a rejected prefix changes nothing.
+ */
+static void knod_bpf_read_batch_group(struct knod_prog *prog,
+				      struct knod_insn_meta *first)
+{
+	struct knod_insn_meta *nodes[16], *loads[8], *m = first;
+	unsigned int n = 0, count = 0, last = 0, i, width;
+	int base = first->insn.src_reg, off;
+
+	if (base > 9 || first->bpf_insn_idx < 0 ||
+	    first->ptr.type != PTR_TO_PACKET ||
+	    !knod_bpf_read_batch_width(&first->insn, true))
+		return;
+	while (n < ARRAY_SIZE(nodes) && count < ARRAY_SIZE(loads)) {
+		if (!knod_bpf_load_pair_free(m) ||
+		    m->subprog_idx != first->subprog_idx ||
+		    m->bpf_insn_idx != first->bpf_insn_idx + n ||
+		    (n && (m->is_merge_point ||
+			   (m->flags & FLAG_INSN_IS_JUMP_DST))))
+			break;
+		width = knod_bpf_read_batch_width(&m->insn, true);
+		if (width) {
+			if (m->ptr.type != PTR_TO_PACKET ||
+			    m->insn.src_reg != base || m->insn.dst_reg > 9 ||
+			    m->insn.dst_reg == base || m->insn.off < -2048 ||
+			    m->insn.off + (int)width > 2048)
+				break;
+			loads[count++] = m;
+			last = n;
+		} else {
+			width = knod_bpf_read_batch_width(&m->insn, false);
+			off = m->dreg.stack_off + m->insn.off;
+			if (!width || m->ptr.type != PTR_TO_STACK ||
+			    m->insn.dst_reg != BPF_REG_FP || m->insn.src_reg > 10 ||
+			    off < -512 || off > -(int)width || (off & (width - 1)))
+				break;
+		}
+		nodes[n++] = m;
+		if (list_is_last(&m->l, &prog->insns))
+			break;
+		m = list_next_entry(m, l);
+	}
+	if (count < 3)
+		return;
+	for (i = 0; i <= last; i++)
+		nodes[i]->read_batch.owned = true;
+	for (i = 0; i < count; i++) {
+		loads[i]->read_batch.load = true;
+		loads[i]->read_batch.slot = i;
+		first->read_batch.off[i] = loads[i]->insn.off;
+		first->read_batch.width[i] =
+			knod_bpf_read_batch_width(&loads[i]->insn, true);
+	}
+	/* Exact adjacent dwords only: no holes, no new address residue. */
+	for (i = 0; i + 1 < count; i++) {
+		if (first->read_batch.width[i] == 4 &&
+		    first->read_batch.width[i + 1] == 4 &&
+		    first->read_batch.off[i + 1] == first->read_batch.off[i] + 4) {
+			first->read_batch.width[i] = 8;
+			first->read_batch.width[++i] = 0;
+		}
+	}
+	first->read_batch.first = true;
+	first->read_batch.base = base;
+	first->read_batch.count = count;
+}
+
+static void knod_bpf_analyze_read_batches(struct knod_bpf_priv *priv,
+					 struct knod_prog *prog)
+{
+	struct knod_insn_meta *m;
+
+	if (priv->isa_version != 10)
+		return;
+	list_for_each_entry(m, &prog->insns, l)
+		knod_bpf_read_batch_group(prog, m);
+}
+
+static void knod_bpf_emit_read_batch(struct knod_bpf_priv *priv,
+				    struct knod_insn_meta *m)
+{
+	struct amdgcn_param32 data, zero;
+	unsigned int i;
+
+	if (m->read_batch.first) {
+		for (i = 0; i < m->read_batch.count; i++) {
+			knod_vset32(&data, KNOD_READ_BATCH_BASE + i);
+			switch (m->read_batch.width[i]) {
+			case 1:
+				knod_emit(priv, m, global_load_ubyte, data,
+					  bpf_reg64[m->read_batch.base].lo,
+					  m->read_batch.off[i]);
+				break;
+			case 2:
+				knod_emit(priv, m, global_load_ushort, data,
+					  bpf_reg64[m->read_batch.base].lo,
+					  m->read_batch.off[i]);
+				break;
+			case 4:
+				knod_emit(priv, m, global_load_dword, data,
+					  bpf_reg64[m->read_batch.base].lo,
+					  m->read_batch.off[i]);
+				break;
+			case 8:
+				knod_emit(priv, m, global_load_dwordx2, data,
+					  bpf_reg64[m->read_batch.base].lo,
+					  m->read_batch.off[i]);
+				break;
+			}
+		}
+		knod_wait_vmcnt(priv, m);
+	}
+	knod_vset32(&data, KNOD_READ_BATCH_BASE + m->read_batch.slot);
+	knod_mov32(priv, m, bpf_reg64[m->insn.dst_reg].lo, data);
+	knod_iset32(&zero, 0);
+	knod_mov32(priv, m, bpf_reg64[m->insn.dst_reg].hi, zero);
+}
+
+#define KNOD_WR_PREFIX 128
+#define KNOD_WR_NODES 24
+#define KNOD_WR_CAPTURE (KNOD_AMDGPU_TMP_VREG3_HI + 1)
+
+struct knod_wr_expr { s16 off; u8 kind; };
+struct knod_wr_workspace {
+	struct knod_insn_meta *prefix[KNOD_WR_PREFIX];
+	struct knod_wr_expr in[KNOD_WR_PREFIX][11];
+	bool reached[KNOD_WR_PREFIX];
+};
+
+static void knod_wr_join(struct knod_wr_workspace *w, unsigned int to,
+			 const struct knod_wr_expr *state)
+{
+	unsigned int r;
+
+	if (!w->reached[to]) {
+		memcpy(w->in[to], state, sizeof(w->in[to]));
+		w->reached[to] = true;
+		return;
+	}
+	for (r = 0; r < 11; r++)
+		if (w->in[to][r].kind != state[r].kind ||
+		    w->in[to][r].off != state[r].off)
+			w->in[to][r] = (struct knod_wr_expr){};
+}
+
+/* Forward CFG intersection, not the verifier's last-visit range snapshot.
+ * kind 1 is this XDP packet's data; kind 2 is its data_end; kind 3 is ctx.
+ */
+static bool knod_wr_certificate(struct knod_prog *prog,
+				struct knod_insn_meta *bound,
+				struct knod_wr_workspace *w,
+				struct knod_wr_expr *state)
+{
+	struct knod_insn_meta *m;
+	unsigned int count = 0, i, j, r, linear = 0;
+	int next, target, off;
+
+	memset(w, 0, sizeof(*w));
+	list_for_each_entry(m, &prog->insns, l) {
+		if (count == KNOD_WR_PREFIX || m->subprog_idx ||
+		    m->bpf_insn_idx < 0)
+			return false;
+		if ((!count && m->bpf_insn_idx) ||
+		    (count && m->bpf_insn_idx !=
+		     w->prefix[count - 1]->bpf_insn_idx + 1))
+			return false;
+		if (count && w->prefix[count - 1]->insn.code ==
+		    (BPF_LD | BPF_DW | BPF_IMM)) {
+			if (m->insn.code || m->insn.dst_reg || m->insn.src_reg ||
+			    m->insn.off || m->is_merge_point ||
+			    (m->flags & FLAG_INSN_IS_JUMP_DST))
+				return false;
+		} else if (!m->insn.code) {
+			return false;
+		}
+		w->prefix[count++] = m;
+		if (m == bound)
+			break;
+	}
+	if (!count || w->prefix[count - 1] != bound)
+		return false;
+	/* No out-of-prefix predecessor may bypass the analyzed entry paths. */
+	list_for_each_entry(m, &prog->insns, l) {
+		if (m->linear_idx != linear++)
+			return false;
+		if (m->linear_idx <= bound->linear_idx)
+			continue;
+		if ((BPF_CLASS(m->insn.code) == BPF_JMP ||
+		     BPF_CLASS(m->insn.code) == BPF_JMP32) &&
+		    BPF_OP(m->insn.code) != BPF_CALL &&
+		    BPF_OP(m->insn.code) != BPF_EXIT && m->merge_point &&
+		    m->merge_point->linear_idx <= bound->linear_idx)
+			return false;
+		if (m->bpf_insn_idx < 0) {
+			/* classify_linear resolves synthetic JA jmp_dst to merge_point. */
+			if (m->insn.code != (BPF_JMP | BPF_JA) || !m->jmp_dst ||
+			    m->jmp_dst != m->merge_point)
+				return false;
+			continue;
+		}
+		if (m->insn.code == (BPF_JMP32 | BPF_JA))
+			return false;
+		if ((BPF_CLASS(m->insn.code) == BPF_JMP ||
+		     BPF_CLASS(m->insn.code) == BPF_JMP32) &&
+		    BPF_OP(m->insn.code) != BPF_CALL &&
+		    BPF_OP(m->insn.code) != BPF_EXIT &&
+		    m->bpf_insn_idx + 1 + m->insn.off <= bound->bpf_insn_idx)
+			return false;
+	}
+	w->reached[0] = true;
+	w->in[0][1].kind = 3; /* XDP entry r1 is the context. */
+	for (i = 0; i < count; i++) {
+		const struct bpf_insn *in;
+		u8 cls, op, d, s;
+
+		if (!w->reached[i])
+			continue;
+		m = w->prefix[i];
+		memcpy(state, w->in[i], sizeof(w->in[i]));
+		if (m == bound)
+			return true;
+		if (i && w->prefix[i - 1]->insn.code ==
+		    (BPF_LD | BPF_DW | BPF_IMM)) {
+			/* prepare/RPO retain the high slot; it is not an instruction. */
+			if (i + 1 < count)
+				knod_wr_join(w, i + 1, state);
+			continue;
+		}
+		in = &m->insn;
+		cls = BPF_CLASS(in->code);
+		op = BPF_OP(in->code);
+		d = in->dst_reg;
+		s = in->src_reg;
+		if (d > 10 || s > 10 ||
+		    (cls == BPF_JMP32 && op == BPF_JA))
+			return false;
+		/* FETCH/CMPXCHG atomics can write src/r0; no affine proof here. */
+		if ((cls == BPF_ST || cls == BPF_STX) &&
+		    BPF_MODE(in->code) != BPF_MEM)
+			return false;
+		if ((cls == BPF_JMP || cls == BPF_JMP32) && op == BPF_CALL &&
+		    in->code != (BPF_JMP | BPF_CALL))
+			return false;
+		if (in->code == (BPF_LDX | BPF_MEM | BPF_W) &&
+		    m->ptr.type == PTR_TO_CTX && state[s].kind == 3 && !state[s].off &&
+		    tnum_is_const(m->ptr.var_off) && !m->ptr.var_off.value &&
+		    (in->off == 0 || in->off == 4)) {
+			state[d] = (struct knod_wr_expr){ .kind = in->off ? 2 : 1 };
+		} else if (in->code == (BPF_ALU64 | BPF_MOV | BPF_X) && !in->off) {
+			state[d] = state[s];
+		} else if (in->code == (BPF_ALU64 | BPF_ADD | BPF_K) &&
+			   state[d].kind && in->imm >= -2048 && in->imm <= 2048) {
+			off = state[d].off + in->imm;
+			state[d] = off >= -2048 && off <= 2048 ?
+				(struct knod_wr_expr){ off, state[d].kind } :
+				(struct knod_wr_expr){};
+		} else if (cls == BPF_LDX || cls == BPF_LD ||
+			   cls == BPF_ALU || cls == BPF_ALU64) {
+			state[d] = (struct knod_wr_expr){};
+		} else if (in->code == (BPF_JMP | BPF_CALL)) {
+			if (in->src_reg || in->imm != BPF_FUNC_map_lookup_elem)
+				return false;
+			for (r = 0; r <= 5; r++)
+				state[r] = (struct knod_wr_expr){};
+		}
+		if (cls == BPF_JMP || cls == BPF_JMP32) {
+			if (op == BPF_EXIT)
+				continue;
+			if (op != BPF_CALL) {
+				target = m->bpf_insn_idx + 1 + in->off;
+				if (!m->merge_point || m->merge_point->bpf_insn_idx != target)
+					return false;
+				if (target <= m->bpf_insn_idx)
+					return false;
+				if (target <= bound->bpf_insn_idx) {
+					for (j = i + 1; j < count; j++)
+						if (w->prefix[j]->bpf_insn_idx == target)
+							break;
+					if (j == count || (j && w->prefix[j - 1]->insn.code ==
+					    (BPF_LD | BPF_DW | BPF_IMM)))
+						return false;
+					knod_wr_join(w, j, state);
+				}
+				if (op == BPF_JA)
+					continue;
+			}
+		}
+		next = i + 1;
+		if (next < count)
+			knod_wr_join(w, next, state);
+	}
+	return false;
+}
+
+static void knod_wr_group(struct knod_prog *prog, struct knod_insn_meta *bound,
+			  struct knod_wr_workspace *w)
+{
+	struct knod_wr_expr state[11];
+	struct knod_insn_meta *nodes[KNOD_WR_NODES], *loads[8], *m, *first;
+	int offsets[8], lo = 2048, hi = 0, base = -1, limit, off;
+	unsigned int n = 0, count = 0, last = 0, i, width;
+
+	if (bound->insn.dst_reg > 10 || bound->insn.src_reg > 10 ||
+	    bound->insn.code != (BPF_JMP | BPF_JGT | BPF_X) ||
+	    bound->branch_type != KNOD_BR_FORWARD_SKIP || bound->jump_neg_op ||
+	    !bound->merge_point || list_is_last(&bound->l, &prog->insns) ||
+	    !knod_wr_certificate(prog, bound, w, state))
+		return;
+	if (state[bound->insn.dst_reg].kind != 1 ||
+	    state[bound->insn.src_reg].kind != 2 ||
+	    state[bound->insn.src_reg].off)
+		return;
+	limit = state[bound->insn.dst_reg].off;
+	if (limit <= 0)
+		return;
+	for (i = 0; i < 10; i++)
+		if (state[i].kind == 1 && !state[i].off) {
+			base = i;
+			break;
+		}
+	if (base < 0)
+		return;
+	first = m = list_next_entry(bound, l);
+	if (!knod_bpf_read_batch_width(&first->insn, true))
+		return;
+	while (n < KNOD_WR_NODES && count < ARRAY_SIZE(loads)) {
+		u8 code = m->insn.code;
+
+		if (!knod_bpf_load_pair_free(m) || m->is_merge_point ||
+		    (m->flags & FLAG_INSN_IS_JUMP_DST) ||
+		    m->subprog_idx != bound->subprog_idx ||
+		    m->bpf_insn_idx != bound->bpf_insn_idx + n + 1)
+			break;
+		width = knod_bpf_read_batch_width(&m->insn, true);
+		if (width) {
+			if (m->ptr.type != PTR_TO_PACKET || m->insn.src_reg > 9 ||
+			    m->insn.dst_reg > 9 || m->insn.dst_reg == base ||
+			    state[m->insn.src_reg].kind != 1)
+				break;
+			off = state[m->insn.src_reg].off + m->insn.off;
+			if (off < 0 || off + (int)width > limit)
+				return;
+			offsets[count] = off;
+			loads[count++] = m;
+			lo = min(lo, off);
+			hi = max(hi, off + (int)width);
+			state[m->insn.dst_reg] = (struct knod_wr_expr){};
+			last = n;
+		} else if (code == (BPF_ALU64 | BPF_AND | BPF_K)) {
+			if (m->insn.dst_reg > 9 || m->insn.dst_reg == base)
+				break;
+			state[m->insn.dst_reg] = (struct knod_wr_expr){};
+		} else if (code == (BPF_JMP | BPF_JNE | BPF_K) ||
+			   code == (BPF_JMP | BPF_JEQ | BPF_K)) {
+			if (m->branch_type != KNOD_BR_FORWARD_SKIP ||
+			    m->jump_neg_op != (BPF_OP(code) == BPF_JNE) ||
+			    !m->merge_point)
+				break;
+		} else {
+			width = knod_bpf_read_batch_width(&m->insn, false);
+			off = m->dreg.stack_off + m->insn.off;
+			if (!width || m->ptr.type != PTR_TO_STACK ||
+			    m->insn.dst_reg != BPF_REG_FP || m->insn.src_reg > 10 ||
+			    off < -512 || off > -(int)width || (off & (width - 1)))
+				break;
+		}
+		nodes[n++] = m;
+		if (list_is_last(&m->l, &prog->insns))
+			break;
+		m = list_next_entry(m, l);
+	}
+	if (count < 3 || hi - lo > 32 || (hi - lo) % 4 ||
+	    bound->merge_point->linear_idx <= nodes[last]->linear_idx)
+		return;
+	for (i = 0; i <= last; i++) {
+		m = nodes[i];
+		if ((m->insn.code == (BPF_JMP | BPF_JNE | BPF_K) ||
+		     m->insn.code == (BPF_JMP | BPF_JEQ | BPF_K)) &&
+		    m->merge_point->linear_idx <= nodes[last]->linear_idx)
+			return;
+	}
+	/* Do not rely solely on cached merge/destination flags. */
+	list_for_each_entry(m, &prog->insns, l) {
+		if ((BPF_CLASS(m->insn.code) == BPF_JMP ||
+		     BPF_CLASS(m->insn.code) == BPF_JMP32) &&
+		    BPF_OP(m->insn.code) != BPF_CALL &&
+		    BPF_OP(m->insn.code) != BPF_EXIT && m->merge_point &&
+		    m->merge_point->linear_idx >= first->linear_idx &&
+		    m->merge_point->linear_idx <= nodes[last]->linear_idx)
+			return;
+	}
+	for (i = 0; i < count; i++) {
+		width = knod_bpf_read_batch_width(&loads[i]->insn, true);
+		if ((offsets[i] - lo) % 4 + width > 4)
+			return;
+	}
+	for (i = 0; i <= last; i++)
+		nodes[i]->wide_read.owned = true;
+	for (i = 0; i < count; i++) {
+		loads[i]->wide_read.load = true;
+		loads[i]->wide_read.half_phase = (lo % 4 == 2 && hi - lo <= 28);
+		loads[i]->wide_read.offset = offsets[i] - lo;
+		loads[i]->wide_read.width =
+			knod_bpf_read_batch_width(&loads[i]->insn, true);
+	}
+	first->wide_read.first = true;
+	first->wide_read.base = base;
+	first->wide_read.off = lo;
+	first->wide_read.bytes = hi - lo;
+}
+
+static void knod_bpf_analyze_wide_reads(struct knod_bpf_priv *priv,
+				       struct knod_prog *prog)
+{
+	struct knod_wr_workspace *w;
+	struct knod_insn_meta *m;
+
+	if (priv->isa_version != 10 || !prog->wide_read_xdp)
+		return;
+	w = kzalloc(sizeof(*w), GFP_KERNEL);
+	if (!w)
+		return;
+	list_for_each_entry(m, &prog->insns, l)
+		knod_wr_group(prog, m, w);
+	kfree(w);
+}
+
+static void knod_bpf_emit_wide_read(struct knod_bpf_priv *priv,
+				   struct knod_insn_meta *m)
+{
+	struct amdgcn_param32 data, shift, mask, zero, next;
+	unsigned int i, width, offset = m->wide_read.offset;
+	bool half = m->wide_read.half_phase;
+
+	if (m->wide_read.first) {
+		/* Capture origin is lo-2, but those two padding bytes are never read. */
+		if (half) {
+			knod_vset32(&data, KNOD_WR_CAPTURE);
+			knod_emit(priv, m, global_load_ushort, data,
+				  bpf_reg64[m->wide_read.base].lo, m->wide_read.off);
+			knod_vset32(&data, KNOD_WR_CAPTURE + m->wide_read.bytes / 4);
+			knod_emit(priv, m, global_load_ushort, data,
+				  bpf_reg64[m->wide_read.base].lo,
+				  m->wide_read.off + m->wide_read.bytes - 2);
+		}
+		for (i = half ? 2 : 0; i < m->wide_read.bytes - (half ? 2 : 0); i += width) {
+			width = min(16U, m->wide_read.bytes - (half ? 2 : 0) - i);
+			knod_vset32(&data, KNOD_WR_CAPTURE + (i + (half ? 2 : 0)) / 4);
+			switch (width) {
+			case 16:
+				knod_emit(priv, m, global_load_dwordx4, data,
+					  bpf_reg64[m->wide_read.base].lo, m->wide_read.off + i);
+				break;
+			case 12:
+				knod_emit(priv, m, global_load_dwordx3, data,
+					  bpf_reg64[m->wide_read.base].lo, m->wide_read.off + i);
+				break;
+			case 8:
+				knod_emit(priv, m, global_load_dwordx2, data,
+					  bpf_reg64[m->wide_read.base].lo, m->wide_read.off + i);
+				break;
+			case 4:
+				knod_emit(priv, m, global_load_dword, data,
+					  bpf_reg64[m->wide_read.base].lo, m->wide_read.off + i);
+				break;
+			}
+		}
+		knod_wait_vmcnt(priv, m);
+		if (half) {
+			knod_vset32(&data, KNOD_WR_CAPTURE);
+			knod_iset32(&shift, 16);
+			knod_emit(priv, m, v_lshlrev_b32, data, shift, data);
+		}
+	}
+	if (half)
+		offset += 2;
+	knod_vset32(&data, KNOD_WR_CAPTURE + offset / 4);
+	if (offset % 4) {
+		knod_iset32(&shift, (offset % 4) * 8);
+		if (offset % 4 + m->wide_read.width > 4) {
+			knod_vset32(&next, KNOD_WR_CAPTURE + offset / 4 + 1);
+			knod_emit(priv, m, v_alignbit_b32, bpf_reg64[m->insn.dst_reg].lo,
+				  next, data, shift);
+		} else {
+			knod_emit(priv, m, v_lshrrev_b32, bpf_reg64[m->insn.dst_reg].lo,
+				  shift, data);
+		}
+		data = bpf_reg64[m->insn.dst_reg].lo;
+	}
+	if (m->wide_read.width < 4) {
+		knod_iset32(&mask, (1U << (m->wide_read.width * 8)) - 1);
+		knod_emit(priv, m, v_and_b32_e32, bpf_reg64[m->insn.dst_reg].lo,
+			  mask, data);
+	} else if (!(offset % 4)) {
+		knod_mov32(priv, m, bpf_reg64[m->insn.dst_reg].lo, data);
+	}
+	knod_iset32(&zero, 0);
+	knod_mov32(priv, m, bpf_reg64[m->insn.dst_reg].hi, zero);
+}
+
+
+/* The common DAG describes BPF effects; this adapter certifies only native
+ * direct W loads and plain MOV encodings. No native temporary stays live.
+ */
+static bool knod_bpf_local_node(struct knod_insn_meta *m,
+			       struct knod_local_effect *f)
+{
+	unsigned int cls = BPF_CLASS(m->insn.code);
+
+	if (m->jit_engine != 1 || m->subprog_idx || m->bpf_insn_idx < 0 ||
+	    m->is_merge_point || m->sr.owner || m->merge_read.role ||
+	    m->local_wait_member || !knod_bpf_load_pair_free(m) ||
+	    (m->flags & (FLAG_INSN_IS_JUMP_DST | FLAG_INSN_IS_SUBPROG_START)))
+		return false;
+	*f = (struct knod_local_effect){.reg = knod_bpf_effect(&m->insn)};
+	if (f->reg.barrier || f->reg.terminal || m->insn.dst_reg > 9)
+		return false;
+	if (m->insn.code == (BPF_LDX | BPF_MEM | BPF_W)) {
+		if (!m->insn.imm && m->insn.src_reg <= 10 &&
+		    m->ptr.type == PTR_TO_STACK) {
+			s64 off = (s64)m->sreg.stack_off + m->insn.off;
+
+			if (off < -512 || off > -4 || (off & 3))
+				return false;
+			f->read = true;
+			f->space = KNOD_MEMORY_PRIVATE_STACK;
+			f->width = 4;
+			return true;
+		}
+		if (m->insn.imm || m->insn.src_reg > 9 ||
+		    (m->ptr.type != PTR_TO_PACKET && m->ptr.type != PTR_TO_MAP_VALUE))
+			return false;
+		f->read = true;
+		f->space = m->ptr.type == PTR_TO_PACKET ?
+			KNOD_MEMORY_PACKET : KNOD_MEMORY_SHARED_MAP;
+		f->width = 4;
+		return true;
+	}
+	return (cls == BPF_ALU || cls == BPF_ALU64) &&
+	       (BPF_OP(m->insn.code) == BPF_MOV ||
+		BPF_OP(m->insn.code) == BPF_AND ||
+		BPF_OP(m->insn.code) == BPF_OR ||
+		BPF_OP(m->insn.code) == BPF_XOR) && !m->insn.off &&
+	       (BPF_SRC(m->insn.code) != BPF_X || m->insn.src_reg <= 10);
+}
+
+/* Bounded local issue/finish scheduling: prioritize independent reads while
+ * retaining memory issue order and every BPF register dependency. Emit the
+ * selected ready order at the head and complete pending results before exit.
+ */
+static void knod_bpf_analyze_local_waits(struct knod_bpf_priv *priv,
+				       struct knod_prog *prog)
+{
+	struct knod_insn_meta *head, *m, *nodes[KNOD_LOCAL_MAX];
+	struct knod_local_effect facts[KNOD_LOCAL_MAX];
+	unsigned char order[KNOD_LOCAL_MAX], scores[KNOD_LOCAL_MAX] = {0};
+	unsigned int n, last, reads, i;
+
+	if (priv->isa_version != 10 || prog->jit_engine != 1)
+		return;
+	list_for_each_entry(head, &prog->insns, l) {
+		m = head;
+		reads = last = n = 0;
+		while (n < KNOD_LOCAL_MAX) {
+			if (!knod_bpf_local_node(m, &facts[n]) ||
+			    head->bpf_insn_idx > INT_MAX - KNOD_LOCAL_MAX ||
+			    head->linear_idx > INT_MAX - KNOD_LOCAL_MAX ||
+			    m->bpf_insn_idx != head->bpf_insn_idx + n ||
+			    m->linear_idx != head->linear_idx + n ||
+			    (!n && !facts[n].read))
+				break;
+			nodes[n] = m;
+			scores[n] = facts[n].read ? 1 : 0;
+			if (facts[n].read) {
+				reads++;
+				last = n;
+			}
+			n++;
+			if (list_is_last(&m->l, &prog->insns))
+				break;
+			m = list_next_entry(m, l);
+		}
+		if (reads < 2 || !knod_local_schedule(facts, scores, last + 1, order))
+			continue;
+		for (i = 0; i <= last; i++)
+			nodes[i]->local_wait_member = true;
+		head->local_issue_count = last + 1;
+		for (i = 0; i <= last; i++)
+			head->local_issue_order[i] = order[i];
+	}
+}
+
+
+static void knod_bpf_emit_local_bitwise(struct knod_bpf_priv *priv,
+				      struct knod_insn_meta *head,
+				      const struct bpf_insn *insn)
+{
+	struct amdgcn_param32 value, dst;
+	unsigned int high, op = BPF_OP(insn->code);
+	bool wide = BPF_CLASS(insn->code) == BPF_ALU64;
+
+	for (high = 0; high < (wide ? 2 : 1); high++) {
+		dst = high ? bpf_reg64[insn->dst_reg].hi :
+			bpf_reg64[insn->dst_reg].lo;
+		if (BPF_SRC(insn->code) == BPF_X) {
+			value = high ? bpf_reg64[insn->src_reg].hi :
+				bpf_reg64[insn->src_reg].lo;
+		} else {
+			if (high && op == BPF_AND && insn->imm < 0)
+				continue;
+			if (high && op == BPF_OR && insn->imm >= 0)
+				continue;
+			knod_iset32(&value, high ? (insn->imm < 0 ? -1 : 0) :
+				    insn->imm);
+			if (high && op != BPF_XOR) {
+				knod_mov32(priv, head, dst, value);
+				continue;
+			}
+		}
+		switch (op) {
+		case BPF_AND:
+			knod_and32(priv, head, dst, value, dst);
+			break;
+		case BPF_OR:
+			knod_or32(priv, head, dst, value, dst);
+			break;
+		case BPF_XOR:
+			knod_xor32(priv, head, dst, value, dst);
+			break;
+		}
+	}
+	if (!wide) {
+		knod_iset32(&value, 0);
+		knod_mov32(priv, head, bpf_reg64[insn->dst_reg].hi, value);
+	}
+}
+
+/* Audited native direct-load/MOV/bitwise/LDS lowering. The common plan contains
+ * only BPF positions; no physical register IDs or native opcodes live there.
+ */
+static void knod_bpf_emit_local_ready(struct knod_bpf_priv *priv,
+				      struct knod_insn_meta *head)
+{
+	struct knod_insn_meta *nodes[KNOD_LOCAL_MAX], *m = head;
+	struct amdgcn_param32 value;
+	unsigned int i, pending = 0, pending_lds = 0;
+	bool has_lds = false;
+
+	if (!head->local_issue_count)
+		return;
+	for (i = 0; i < head->local_issue_count; i++) {
+		nodes[i] = m;
+		has_lds |= m->insn.code == (BPF_LDX | BPF_MEM | BPF_W) &&
+			m->ptr.type == PTR_TO_STACK;
+		m = list_next_entry(m, l);
+	}
+	/* Keep pre-existing private-stack writes complete at region entry. */
+	if (has_lds)
+		knod_emit(priv, head, s_waitcnt_lgkmcnt);
+	for (i = 0; i < head->local_issue_count; i++) {
+		struct knod_bpf_effect effect;
+		unsigned int dst;
+
+		m = nodes[head->local_issue_order[i]];
+		dst = m->insn.dst_reg;
+		effect = knod_bpf_effect(&m->insn);
+		if (pending & (effect.uses | effect.defs)) {
+			knod_wait_vmcnt(priv, head);
+			pending = 0;
+		}
+		if (pending_lds & (effect.uses | effect.defs)) {
+			knod_emit(priv, head, s_waitcnt_lgkmcnt);
+			pending_lds = 0;
+		}
+		if (BPF_CLASS(m->insn.code) == BPF_LDX &&
+		    m->ptr.type == PTR_TO_STACK) {
+			struct amdgcn_param32 base;
+			int off = 512 + m->sreg.stack_off + m->insn.off;
+
+			knod_vset32(&base, knod_bpf_lds_vreg(priv,
+						       KNOD_AMDGPU_LDS_BASE_VREG));
+			knod_emit(priv, head, ds_read_b32, bpf_reg64[dst].lo,
+				  base, knod_bpf_lds_off(priv, m, off));
+			knod_iset32(&value, 0);
+			knod_mov32(priv, head, bpf_reg64[dst].hi, value);
+			pending_lds |= effect.defs;
+			continue;
+		}
+		if (BPF_CLASS(m->insn.code) == BPF_LDX) {
+			knod_emit(priv, head, global_load_dword, bpf_reg64[dst].lo,
+				  bpf_reg64[m->insn.src_reg].lo, m->insn.off);
+			knod_iset32(&value, 0);
+			knod_mov32(priv, head, bpf_reg64[dst].hi, value);
+			pending |= effect.defs;
+			continue;
+		}
+		if (BPF_OP(m->insn.code) != BPF_MOV) {
+			knod_bpf_emit_local_bitwise(priv, head, &m->insn);
+			continue;
+		}
+		if (BPF_SRC(m->insn.code) == BPF_X)
+			value = bpf_reg64[m->insn.src_reg].lo;
+		else
+			knod_iset32(&value, m->insn.imm);
+		knod_mov32(priv, head, bpf_reg64[dst].lo, value);
+		if (BPF_CLASS(m->insn.code) == BPF_ALU)
+			knod_iset32(&value, 0);
+		else if (BPF_SRC(m->insn.code) == BPF_X)
+			value = bpf_reg64[m->insn.src_reg].hi;
+		else
+			knod_iset32(&value, m->insn.imm < 0 ? -1 : 0);
+		knod_mov32(priv, head, bpf_reg64[dst].hi, value);
+	}
+	if (pending)
+		knod_wait_vmcnt(priv, head);
+	if (pending_lds)
+		knod_emit(priv, head, s_waitcnt_lgkmcnt);
+}
+
+/* One bounded pair of predecessor chains, certified on the final CFG. */
+#define KNOD_MP_PREFIX 128
+#define KNOD_MP_PATH 24
+struct knod_mp_state {
+	struct knod_wr_expr reg[11];
+	s16 bound;
+	bool reached;
+};
+struct knod_mp_workspace {
+	struct knod_insn_meta *node[KNOD_MP_PREFIX];
+	struct knod_mp_state in[KNOD_MP_PREFIX];
+	short edge[KNOD_MP_PREFIX][2];
+	unsigned char color[KNOD_MP_PREFIX], depth[KNOD_MP_PREFIX];
+	unsigned count, producers, visits;
+	struct knod_insn_meta *producer[2];
+};
+static void knod_mp_join(struct knod_mp_state *d, const struct knod_mp_state *s)
+{
+	unsigned r;
+	if (!d->reached) {
+		*d = *s;
+		return;
+	}
+	for (r = 0; r < 11; r++)
+		if (d->reg[r].kind != s->reg[r].kind ||
+		    d->reg[r].off != s->reg[r].off)
+			d->reg[r] = (struct knod_wr_expr){};
+	if (s->bound < d->bound)
+		d->bound = s->bound;
+}
+static bool knod_mp_certificate(struct knod_prog *prog,
+				struct knod_insn_meta *tail,
+				struct knod_mp_workspace *w)
+{
+	struct knod_insn_meta *m;
+	unsigned i, j, count = 0, linear = 0;
+	memset(w, 0, sizeof(*w));
+	list_for_each_entry(m, &prog->insns, l)
+	{
+		if (m->linear_idx != linear++ || m->subprog_idx)
+			return false;
+		if (count == KNOD_MP_PREFIX)
+			return false;
+		w->node[count++] = m;
+		if (m == tail)
+			break;
+	}
+	if (!count || w->node[count - 1] != tail)
+		return false;
+	w->count = count;
+	/* Classified final graph only; include synthetic routing and reject
+	 * backward entry. */
+	list_for_each_entry(m, &prog->insns, l)
+	{
+		unsigned cls = BPF_CLASS(m->insn.code),
+			 op = BPF_OP(m->insn.code);
+		if ((cls == BPF_JMP || cls == BPF_JMP32) && op != BPF_CALL &&
+		    op != BPF_EXIT) {
+			if (!m->merge_point ||
+			    m->merge_point->linear_idx <= m->linear_idx)
+				return false;
+			if (m->bpf_insn_idx < 0 &&
+			    (m->insn.code != (BPF_JMP | BPF_JA) ||
+			     m->jmp_dst != m->merge_point))
+				return false;
+			if (m->linear_idx >= count &&
+			    m->merge_point->linear_idx < count)
+				return false;
+		}
+	}
+	for (i = 0; i < count; i++) {
+		const struct bpf_insn *b = &w->node[i]->insn;
+		unsigned cls = BPF_CLASS(b->code), op = BPF_OP(b->code);
+		w->edge[i][0] = i + 1 < count ? (short)(i + 1) : -1;
+		w->edge[i][1] = -1;
+		if ((cls == BPF_JMP || cls == BPF_JMP32) && op == BPF_EXIT)
+			w->edge[i][0] = -1;
+		else if ((cls == BPF_JMP || cls == BPF_JMP32) &&
+			 op != BPF_CALL) {
+			struct knod_insn_meta *t = w->node[i]->merge_point;
+			if (w->node[i]->branch_type != KNOD_BR_FORWARD_SKIP &&
+			    w->node[i]->branch_type != KNOD_BR_FORWARD_GOTO &&
+			    w->node[i]->branch_type != KNOD_BR_DIRECT_EXIT)
+				return false;
+			if (w->node[i]->branch_type != KNOD_BR_DIRECT_EXIT &&
+			    (!t->is_merge_point ||
+			     (op == BPF_JA ? w->node[i]->branch_type !=
+						 KNOD_BR_FORWARD_GOTO
+					   : w->node[i]->branch_type !=
+						 KNOD_BR_FORWARD_SKIP)))
+				return false;
+			if (t->linear_idx < count) {
+				if (w->node[t->linear_idx] != t)
+					return false;
+				w->edge[i][1] = t->linear_idx;
+			}
+			if (op == BPF_JA)
+				w->edge[i][0] = -1;
+		}
+	}
+	w->in[0].reached = true;
+	w->in[0].reg[1].kind = 3;
+	for (i = 0; i < count; i++) {
+		struct knod_mp_state st = w->in[i], fall;
+		const struct bpf_insn *b = &w->node[i]->insn;
+		unsigned cls = BPF_CLASS(b->code), op = BPF_OP(b->code),
+			 d = b->dst_reg, s = b->src_reg;
+		int off;
+		if (!st.reached)
+			continue;
+		if (d > 10 || s > 10)
+			return false;
+		if (!b->code) {
+			if (!i ||
+			    w->node[i - 1]->insn.code !=
+				(BPF_LD | BPF_DW | BPF_IMM) ||
+			    w->node[i]->bpf_insn_idx !=
+				w->node[i - 1]->bpf_insn_idx + 1 ||
+			    b->dst_reg || b->src_reg || b->off ||
+			    w->node[i]->is_merge_point)
+				return false;
+		} else if (b->code == (BPF_LDX | BPF_MEM | BPF_W) &&
+			   w->node[i]->ptr.type == PTR_TO_CTX &&
+			   st.reg[s].kind == 3 && !st.reg[s].off &&
+			   (b->off == 0 || b->off == 4))
+			st.reg[d] =
+			    (struct knod_wr_expr){.kind = b->off ? 2 : 1};
+		else if (b->code == (BPF_ALU64 | BPF_MOV | BPF_X))
+			st.reg[d] = st.reg[s];
+		else if (b->code == (BPF_ALU64 | BPF_ADD | BPF_K) &&
+			 st.reg[d].kind && b->imm >= -2048 && b->imm <= 2048) {
+			off = st.reg[d].off + b->imm;
+			st.reg[d] =
+			    off >= -2048 && off <= 2048
+				? (struct knod_wr_expr){off, st.reg[d].kind}
+				: (struct knod_wr_expr){};
+		} else if (cls == BPF_LDX || cls == BPF_LD || cls == BPF_ALU ||
+			   cls == BPF_ALU64)
+			st.reg[d] = (struct knod_wr_expr){};
+		else if ((cls == BPF_JMP || cls == BPF_JMP32) &&
+			 op == BPF_CALL) {
+			if (b->code != (BPF_JMP | BPF_CALL) || b->src_reg ||
+			    b->imm != BPF_FUNC_map_lookup_elem)
+				return false;
+			for (j = 0; j < 6; j++)
+				st.reg[j] = (struct knod_wr_expr){};
+		} else if ((cls == BPF_ST || cls == BPF_STX) &&
+			   BPF_MODE(b->code) != BPF_MEM)
+			return false;
+		fall = st;
+		if (b->code == (BPF_JMP | BPF_JGT | BPF_X) &&
+		    !w->node[i]->jump_neg_op && w->in[i].reg[d].kind == 1 &&
+		    w->in[i].reg[s].kind == 2 && !w->in[i].reg[s].off &&
+		    w->in[i].reg[d].off > fall.bound)
+			fall.bound = w->in[i].reg[d].off;
+		if (w->edge[i][0] >= 0)
+			knod_mp_join(&w->in[w->edge[i][0]], &fall);
+		if (w->edge[i][1] >= 0)
+			knod_mp_join(&w->in[w->edge[i][1]], &st);
+	}
+	return w->in[count - 1].reached;
+}
+static bool knod_mp_cover(struct knod_mp_workspace *w)
+{
+	struct knod_insn_meta *tail = w->node[w->count - 1];
+	unsigned at, base = tail->insn.src_reg, dst = tail->insn.dst_reg;
+	w->color[w->count - 1] = 1;
+	for (at = w->count; at-- > 0;) {
+		struct knod_insn_meta *m = w->node[at];
+		const struct bpf_insn *b = &m->insn;
+		struct knod_bpf_effect e;
+		unsigned i, k, preds = 0;
+		if (!w->color[at])
+			continue;
+		if (w->depth[at] > KNOD_MP_PATH)
+			return false;
+		w->visits++;
+		if (at != w->count - 1) {
+			if (m->merge_read.role || m->sr.owner ||
+			    !knod_bpf_load_pair_free(m))
+				return false;
+			/* Every selected producer path must reach tail; no side
+			 * exit observes early dst. */
+			if ((w->edge[at][0] >= 0) + (w->edge[at][1] >= 0) != 1)
+				return false;
+			if ((BPF_CLASS(b->code) == BPF_JMP ||
+			     BPF_CLASS(b->code) == BPF_JMP32) &&
+			    BPF_OP(b->code) != BPF_JA)
+				return false;
+			if (b->code == (BPF_LDX | BPF_MEM | BPF_H) &&
+			    m->ptr.type == PTR_TO_PACKET &&
+			    b->src_reg == base && b->dst_reg <= 9 && b->dst_reg != base &&
+			    b->dst_reg != dst && b->off >= 0 &&
+			    b->off + 2 == tail->insn.off) {
+				if (!w->in[at].reached ||
+				    w->in[at].reg[base].kind != 1 ||
+				    w->in[at].reg[base].off ||
+				    w->in[at].bound < tail->insn.off + 2)
+					return false;
+				if (w->producers == 2)
+					return false;
+				w->producer[w->producers++] = m;
+				w->color[at] = 2;
+				continue;
+			}
+			e = knod_bpf_effect(b);
+			if (((e.uses | e.defs) & ((1U << dst) | (1U << base))))
+				return false;
+			if (e.barrier && !((BPF_CLASS(b->code) == BPF_JMP ||
+					    BPF_CLASS(b->code) == BPF_JMP32) &&
+					   BPF_OP(b->code) != BPF_CALL &&
+					   BPF_OP(b->code) != BPF_EXIT))
+				return false;
+			if (BPF_CLASS(b->code) == BPF_LDX ||
+			    BPF_CLASS(b->code) == BPF_LD)
+				return false;
+			if (BPF_CLASS(b->code) == BPF_ST ||
+			    BPF_CLASS(b->code) == BPF_STX) {
+				if (BPF_MODE(b->code) != BPF_MEM ||
+				    m->ptr.type != PTR_TO_STACK)
+					return false;
+			}
+		}
+
+		for (i = 0; i < at; i++)
+			for (k = 0; k < 2; k++)
+				if (w->edge[i][k] == (int)at &&
+				    w->in[i].reached) {
+					preds++;
+					w->color[i] = 1;
+					if (w->depth[i] < w->depth[at] + 1)
+						w->depth[i] = w->depth[at] + 1;
+				}
+		if (!preds)
+			return false;
+		w->color[at] = 2;
+	}
+	return true;
+}
+static bool knod_mp_try(struct knod_prog *prog, struct knod_insn_meta *tail,
+			struct knod_mp_workspace *w)
+{
+	if (tail->insn.code != (BPF_LDX | BPF_MEM | BPF_H) ||
+	    tail->ptr.type != PTR_TO_PACKET || tail->insn.src_reg > 9 ||
+	    tail->insn.dst_reg > 9 ||
+	    tail->insn.src_reg == tail->insn.dst_reg || tail->merge_read.role ||
+	    !tail->is_merge_point || tail->sr.owner ||
+	    !knod_bpf_load_pair_free(tail) || tail->insn.off < 2)
+		return false;
+	return knod_mp_certificate(prog, tail, w) && knod_mp_cover(w) &&
+	       w->producers == 2;
+}
+static void knod_bpf_analyze_merge_reads(struct knod_bpf_priv *priv,
+					 struct knod_prog *prog)
+{
+	struct knod_mp_workspace *w;
+	struct knod_insn_meta *m;
+	unsigned i;
+	if (priv->isa_version != 10 || prog->jit_engine != 1 || !prog->wide_read_xdp)
+		return;
+	w = kzalloc(sizeof(*w), GFP_KERNEL);
+	if (!w)
+		return;
+	list_for_each_entry(m, &prog->insns, l)
+	{
+		if (m->jit_engine != 1 || !knod_mp_try(prog, m, w))
+			continue;
+		if (w->producer[0]->jit_engine != 1 ||
+		    w->producer[1]->jit_engine != 1)
+			continue;
+		/* All proof completed before publishing any selected metadata.
+		 * One group per program avoids early definitions invalidating
+		 * another certificate. */
+		for (i = 0; i < 2; i++) {
+			w->producer[i]->merge_read.off = m->insn.off;
+			w->producer[i]->merge_read.dst = m->insn.dst_reg;
+			w->producer[i]->merge_read.role = 1;
+		}
+		m->merge_read.role = 2;
+		break;
+	}
+	kfree(w);
+}
+static void knod_bpf_emit_merge_read(struct knod_bpf_priv *priv,
+				     struct knod_insn_meta *m)
+{
+	struct amdgcn_param32 zero, shift, mask;
+	if (m->merge_read.role != 1)
+		return;
+
+	/* The certificate covers exactly these four private packet bytes.
+	 * GFX10 native ABI12 queues enable UNALIGNED before dispatch.
+	 */
+	knod_emit(priv, m, global_load_dword, bpf_reg64[m->insn.dst_reg].lo,
+		  bpf_reg64[m->insn.src_reg].lo, m->insn.off);
+	knod_wait_vmcnt(priv, m);
+	knod_iset32(&shift, 16);
+	knod_emit(priv, m, v_lshrrev_b32, bpf_reg64[m->merge_read.dst].lo,
+		  shift, bpf_reg64[m->insn.dst_reg].lo);
+	knod_iset32(&mask, 0xffff);
+	knod_emit(priv, m, v_and_b32_e32, bpf_reg64[m->insn.dst_reg].lo,
+		  mask, bpf_reg64[m->insn.dst_reg].lo);
+	knod_iset32(&zero, 0);
+	knod_mov32(priv, m, bpf_reg64[m->insn.dst_reg].hi, zero);
+	knod_mov32(priv, m, bpf_reg64[m->merge_read.dst].hi, zero);
+}
+
+static void knod_bpf_load_pair_group(struct knod_prog *prog,
+		struct knod_insn_meta *a)
+{
+	struct knod_insn_meta *b, *c;
+	int base = a->insn.src_reg, off;
+
+	if (list_is_last(&a->l, &prog->insns))
+		return;
+	b = list_next_entry(a, l);
+	if (list_is_last(&b->l, &prog->insns))
+		return;
+	c = list_next_entry(b, l);
+	if (!knod_bpf_load_pair_free(a) || !knod_bpf_load_pair_free(b) ||
+	    !knod_bpf_load_pair_free(c) || base > 9 ||
+	    a->insn.code != (BPF_LDX | BPF_MEM | BPF_W) ||
+	    c->insn.code != (BPF_LDX | BPF_MEM | BPF_W) ||
+	    a->ptr.type != PTR_TO_PACKET || c->ptr.type != PTR_TO_PACKET ||
+	    c->insn.src_reg != base || a->insn.dst_reg == base ||
+	    a->insn.dst_reg > 9 || c->insn.dst_reg > 9 ||
+	    b->insn.code != (BPF_STX | BPF_MEM | BPF_W) ||
+	    b->ptr.type != PTR_TO_STACK || b->insn.dst_reg != BPF_REG_FP ||
+	    b->dreg.stack_off + b->insn.off < -512 ||
+	    b->dreg.stack_off + b->insn.off > -4 ||
+	    b->insn.src_reg > 10 || ((b->dreg.stack_off + b->insn.off) & 3) ||
+	    b->is_merge_point || c->is_merge_point ||
+	    ((b->flags | c->flags) & FLAG_INSN_IS_JUMP_DST) ||
+	    a->subprog_idx != b->subprog_idx || a->subprog_idx != c->subprog_idx ||
+	    a->bpf_insn_idx < 0 || b->bpf_insn_idx != a->bpf_insn_idx + 1 ||
+	    c->bpf_insn_idx != b->bpf_insn_idx + 1 ||
+	    (c->insn.off != a->insn.off + 4 && a->insn.off != c->insn.off + 4))
+		return;
+	off = min(a->insn.off, c->insn.off);
+	if (off < -2048 || off + 7 >= 2048)
+		return;
+	a->load_pair.first = c->load_pair.last = true;
+	a->load_pair.owned = b->load_pair.owned = c->load_pair.owned = true;
+	a->load_pair.off = off;
+	a->load_pair.base = base;
+	a->load_pair.word = (a->insn.off - off) / 4;
+	c->load_pair.word = (c->insn.off - off) / 4;
+}
+
+static void knod_bpf_analyze_load_pairs(struct knod_bpf_priv *priv,
+		struct knod_prog *prog)
+{
+	struct knod_insn_meta *m;
+	list_for_each_entry(m, &prog->insns, l)
+		memset(&m->load_pair, 0, sizeof(m->load_pair));
+	if (priv->isa_version != 10)
+		return;
+	list_for_each_entry(m, &prog->insns, l)
+		knod_bpf_load_pair_group(prog, m);
+}
+
+static void knod_bpf_emit_load_pair(struct knod_bpf_priv *priv,
+		struct knod_insn_meta *m)
+{
+	struct amdgcn_param32 data, zero;
+	if (m->load_pair.first) {
+		knod_vset32(&data, KNOD_AMDGPU_TMP_VREG0_LO);
+		knod_emit(priv, m, global_load_dwordx2, data,
+			bpf_reg64[m->load_pair.base].lo, m->load_pair.off);
+		knod_emit(priv, m, s_waitcnt_vmcnt);
+	}
+	knod_vset32(&data, KNOD_AMDGPU_TMP_VREG0_LO + m->load_pair.word);
+	knod_mov32(priv, m, bpf_reg64[m->insn.dst_reg].lo, data);
+	knod_iset32(&zero, 0);
+	knod_mov32(priv, m, bpf_reg64[m->insn.dst_reg].hi, zero);
+}
+
+/* Bounded frontend proof: no runtime values or target ISA are inspected. */
+static bool knod_bpf_addr_fact_boundary(const struct knod_insn_meta *m)
+{
+	return m->is_merge_point ||
+		(m->flags & (FLAG_INSN_IS_JUMP_DST | FLAG_INSN_IS_SUBPROG_START));
+}
+
+static bool knod_bpf_key_literal(struct knod_prog *prog,
+				struct knod_insn_meta *call, u32 *key)
+{
+	struct knod_insn_meta *m = call, *prev;
+	int expected = call->bpf_insn_idx - 1, n, off;
+	unsigned int width;
+	u64 value;
+	int key_off = call->kreg.stack_off;
+
+	if (call->kreg.reg.type != PTR_TO_STACK || key_off < -512 || key_off > -4)
+		return false;
+	for (n = 0; n < 16; n++) {
+		if (list_is_first(&m->l, &prog->insns))
+			return false;
+		m = list_prev_entry(m, l);
+		if (m->bpf_insn_idx != expected-- || m->subprog_idx != call->subprog_idx ||
+		    knod_bpf_addr_fact_boundary(m))
+			return false;
+		if (BPF_CLASS(m->insn.code) == BPF_JMP ||
+		    BPF_CLASS(m->insn.code) == BPF_JMP32)
+			return false;
+		if (BPF_CLASS(m->insn.code) != BPF_ST &&
+		    BPF_CLASS(m->insn.code) != BPF_STX)
+			continue;
+		if (BPF_MODE(m->insn.code) != BPF_MEM || m->ptr.type != PTR_TO_STACK ||
+		    m->ptr.frameno != call->kreg.reg.frameno)
+			return false;
+		width = BPF_SIZE(m->insn.code) == BPF_B ? 1 :
+			BPF_SIZE(m->insn.code) == BPF_H ? 2 :
+			BPF_SIZE(m->insn.code) == BPF_W ? 4 : 8;
+		off = m->dreg.stack_off + m->insn.off;
+		if (off + (int)width <= key_off || off >= key_off + 4)
+			continue;
+		/* A partial latest write is ambiguous; do not scan through it. */
+		if (off > key_off || off + (int)width < key_off + 4)
+			return false;
+		if (BPF_CLASS(m->insn.code) == BPF_ST) {
+			value = (s64)m->insn.imm;
+		} else {
+			if (list_is_first(&m->l, &prog->insns))
+				return false;
+			prev = list_prev_entry(m, l);
+			if (prev->bpf_insn_idx != m->bpf_insn_idx - 1 ||
+			    prev->subprog_idx != call->subprog_idx ||
+			    prev->insn.dst_reg != m->insn.src_reg)
+				return false;
+			if (prev->insn.code == (BPF_ALU64 | BPF_MOV | BPF_K))
+				value = (s64)prev->insn.imm;
+			else if (prev->insn.code == (BPF_ALU | BPF_MOV | BPF_K))
+				value = (u32)prev->insn.imm;
+			else
+				return false;
+		}
+		*key = value >> ((key_off - off) * 8);
+		return true;
+	}
+	return false;
+}
+
+static bool knod_bpf_percpu_addr_proven(struct knod_prog *prog,
+				      struct knod_insn_meta *store)
+{
+	struct knod_insn_meta *m = store, *call = NULL, *lo, *hi;
+	const struct bpf_map *map = store->dreg.reg.map_ptr;
+	int expected = store->bpf_insn_idx - 1, n;
+	bool null_guard = false;
+	u64 literal;
+	u32 key;
+
+	if (!store->percpu_rmw_add || !store->percpu_rmw_uniform ||
+	    store->insn.dst_reg != BPF_REG_0 || store->ptr.type != PTR_TO_MAP_VALUE ||
+	    !map || map->map_type != BPF_MAP_TYPE_PERCPU_ARRAY || map->key_size != 4 ||
+	    knod_bpf_addr_fact_boundary(store))
+		return false;
+	for (n = 0; n < 16; n++) {
+		if (list_is_first(&m->l, &prog->insns))
+			return false;
+		m = list_prev_entry(m, l);
+		if (m->bpf_insn_idx != expected-- || m->subprog_idx != store->subprog_idx ||
+		    knod_bpf_addr_fact_boundary(m))
+			return false;
+		if (m->insn.code == (BPF_JMP | BPF_CALL)) {
+			if (!null_guard || m->insn.src_reg || m->insn.imm != BPF_FUNC_map_lookup_elem)
+				return false;
+			call = m;
+			break;
+		}
+		if (BPF_CLASS(m->insn.code) == BPF_JMP || BPF_CLASS(m->insn.code) == BPF_JMP32) {
+			if (null_guard || m->insn.code != (BPF_JMP | BPF_JEQ | BPF_K) ||
+			    m->insn.dst_reg != BPF_REG_0 || m->insn.imm || m->insn.off <= 0 ||
+			    m->bpf_insn_idx + 1 + m->insn.off <= store->bpf_insn_idx)
+				return false;
+			null_guard = true;
+			/* The guard must immediately follow the originating lookup. */
+			continue;
+		}
+		if (null_guard || knod_bpf_effect(&m->insn).barrier ||
+		    (knod_bpf_effect(&m->insn).defs & (1U << BPF_REG_0)))
+			return false;
+	}
+	if (!call || list_is_first(&call->l, &prog->insns))
+		return false;
+	hi = list_prev_entry(call, l);
+	if (list_is_first(&hi->l, &prog->insns))
+		return false;
+	lo = list_prev_entry(hi, l);
+	/* Resolve the exact immutable map literal, not a stale verifier hint. */
+	if (hi->bpf_insn_idx != call->bpf_insn_idx - 1 ||
+	    lo->bpf_insn_idx != call->bpf_insn_idx - 2 || hi->insn.code ||
+	    lo->insn.code != (BPF_LD | BPF_IMM | BPF_DW) ||
+	    lo->insn.dst_reg != BPF_REG_1 || lo->insn.src_reg != BPF_PSEUDO_MAP_FD ||
+	    knod_bpf_addr_fact_boundary(lo) || knod_bpf_addr_fact_boundary(hi))
+		return false;
+	literal = (u32)lo->insn.imm | ((u64)(u32)hi->insn.imm << 32);
+	if (literal != (u64)(unsigned long)map || !knod_bpf_key_literal(prog, call, &key))
+		return false;
+	return key < map->max_entries;
+}
+
+static void knod_bpf_analyze_addr_proof(struct knod_bpf_priv *priv, struct knod_prog *prog)
+{
+	struct knod_insn_meta *m;
+
+	list_for_each_entry(m, &prog->insns, l) {
+		m->array_key_proven = false;
+		m->array_key_literal = 0;
+		if (priv->isa_version == 10 && m->jit_engine == 1 &&
+		    !knod_bpf_addr_fact_boundary(m) &&
+		    m->insn.code == (BPF_JMP | BPF_CALL) &&
+		    !m->insn.src_reg && m->insn.imm == BPF_FUNC_map_lookup_elem)
+			m->array_key_proven = knod_bpf_key_literal(prog, m,
+							 &m->array_key_literal);
+		m->percpu_addr_proven = false;
+		if (priv->isa_version == 10)
+			m->percpu_addr_proven = knod_bpf_percpu_addr_proven(prog, m);
+	}
+}
+
 static int knod_bpf_jit(struct knod_dev *knodev,
 			struct knod_prog *knod_prog)
 {
@@ -6986,6 +11336,7 @@ static int knod_bpf_jit(struct knod_dev *knodev,
 	struct knod_insn_meta *meta, *meta2;
 	struct amdgcn_param64 param64[2];
 	u32 insn_idx = 0;
+	unsigned int copy_skip = 0, copied;
 	struct amdgcn_param32 param[3];
 	struct amdgcn_param32 p32[2];
 	int s, d, imm, imm2;
@@ -7003,9 +11354,48 @@ static int knod_bpf_jit(struct knod_dev *knodev,
 	if (ret)
 		return ret;
 
+	knod_prog->jit_engine = knod_bpf_jit_engine;
+	knod_prog->wide_read_xdp = knod_prog->type == BPF_PROG_TYPE_XDP;
+	list_for_each_entry(meta, &knod_prog->insns, l)
+		meta->jit_engine = knod_bpf_jit_engine;
 	ret = knod_prog_prepare_insns(priv, knod_prog);
 	if (ret)
 		return ret;
+
+	list_for_each_entry(meta, &knod_prog->insns, l) {
+		memset(&meta->map_widen, 0, sizeof(meta->map_widen));
+		memset(&meta->wide_read, 0, sizeof(meta->wide_read));
+		memset(&meta->read_batch, 0, sizeof(meta->read_batch));
+		memset(&meta->merge_read, 0, sizeof(meta->merge_read));
+		meta->local_wait_member = false;
+		meta->local_wait_defer = false;
+		meta->local_issue_count = 0;
+		memset(meta->local_issue_order, 0, sizeof(meta->local_issue_order));
+		memset(&meta->load_pair, 0, sizeof(meta->load_pair));
+		meta->percpu_dead = false;
+		meta->percpu_delta_direct = false;
+		memset(&meta->map_region, 0, sizeof(meta->map_region));
+		meta->map_lds_head = false;
+		meta->map_lds_tail = false;
+	}
+
+	knod_bpf_analyze_addr_proof(priv, knod_prog);
+	knod_bpf_analyze_memory(knod_prog);
+	knod_bpf_analyze_packet_regions(priv, knod_prog);
+	knod_bpf_analyze_conststores(priv, knod_prog);
+	knod_bpf_analyze_store_hoists(priv, knod_prog);
+	knod_bpf_analyze_sinks(priv, knod_prog);
+	knod_bpf_analyze_map_widen(priv, knod_prog);
+	knod_bpf_analyze_wide_reads(priv, knod_prog);
+	knod_bpf_analyze_read_batches(priv, knod_prog);
+	knod_bpf_analyze_load_pairs(priv, knod_prog);
+	knod_bpf_analyze_percpu_dead(priv, knod_prog);
+	knod_bpf_analyze_store_regions(priv, knod_prog);
+	knod_bpf_analyze_map_lds(priv, knod_prog);
+	knod_bpf_analyze_map_regions(priv, knod_prog);
+	knod_bpf_analyze_swapped_dead(priv, knod_prog);
+	knod_bpf_analyze_merge_reads(priv, knod_prog);
+
 
 	/* Fold the depth again from what will actually be emitted, on the same
 	 * test the emitter makes, now that every pointer state is final.  The
@@ -7048,6 +11438,8 @@ static int knod_bpf_jit(struct knod_dev *knodev,
 		return -E2BIG;
 	}
 
+	knod_bpf_analyze_local_waits(priv, knod_prog);
+
 	/* Initialize all exec_save SGPRs to 0.
 	 * Without this, merge points that restore from exec_save SGPRs
 	 * of branches that were skipped (by an outer s_cbranch_execz)
@@ -7073,6 +11465,15 @@ static int knod_bpf_jit(struct knod_dev *knodev,
 		insn_idx += knod_meta_bytes(meta) / 4;
 
 	list_for_each_entry(meta, &knod_prog->insns, l) {
+		if (copy_skip) {
+			copy_skip--;
+			meta->amdgpu_insn_idx = AMDGPU_INSN_SKIP;
+			meta->amdgpu_insns = 0;
+			meta->blob = NULL;
+			meta->blob_size = 0;
+			meta->blob_at = 0;
+			continue;
+		}
 		if (skip) {
 			skip = false;
 			meta->amdgpu_insn_idx = AMDGPU_INSN_SKIP;
@@ -7085,6 +11486,8 @@ static int knod_bpf_jit(struct knod_dev *knodev,
 
 		meta->amdgpu_insn_idx = insn_idx;
 		meta->amdgpu_insns = 0;
+		meta->sr.cursor = 0;
+		meta->sr.error = false;
 		/* Rewinding the cursor has to rewind the splice with it, or a
 		 * second translation of the same metas keeps a routine from
 		 * the first and puts it at an offset that no longer means
@@ -7114,6 +11517,73 @@ static int knod_bpf_jit(struct knod_dev *knodev,
 				  knod_prog->done_mask_sreg);
 				}
 
+		if (meta->local_wait_member) {
+			knod_bpf_emit_local_ready(priv, meta);
+			goto insn_emitted;
+		}
+
+		if (meta->merge_read.role) {
+			knod_bpf_emit_merge_read(priv, meta);
+			goto insn_emitted;
+		}
+		if (meta->map_widen.owned) {
+			knod_bpf_emit_map_widen(priv, meta);
+			goto insn_emitted;
+		}
+		if (meta->wide_read.load) {
+			knod_bpf_emit_wide_read(priv, meta);
+			goto insn_emitted;
+		}
+		if (meta->read_batch.load) {
+			knod_bpf_emit_read_batch(priv, meta);
+			goto insn_emitted;
+		}
+		if (meta->percpu_dead)
+			goto insn_emitted;
+		if (meta->load_pair.first || meta->load_pair.last) {
+			knod_bpf_emit_load_pair(priv, meta);
+			goto insn_emitted;
+		}
+		if (meta->sink.member) {
+			knod_bpf_emit_sink(priv, meta);
+			goto insn_emitted;
+		}
+		if (meta->conststore.elide || meta->store_hoist.elide) {
+			meta->amdgpu_insn_idx = AMDGPU_INSN_SKIP;
+			meta->amdgpu_insns = 0;
+			meta->blob = NULL;
+			meta->blob_size = 0;
+			meta->blob_at = 0;
+			continue;
+		}
+		if (meta->conststore.bytes) {
+			knod_bpf_emit_conststore(priv, meta);
+			goto insn_emitted;
+		}
+
+		if (meta->store_hoist.emit) {
+			knod_bpf_emit_store_hoist(priv, meta);
+			goto insn_emitted;
+		}
+
+		copied = knod_bpf_emit_packet_region(priv, meta);
+		if (!copied)
+			copied = knod_bpf_emit_loads(priv, meta);
+		if (!copied)
+			copied = knod_bpf_emit_copy(priv, meta);
+		if (!copied)
+			copied = knod_bpf_emit_store(priv, meta);
+		if (copied) {
+			copy_skip = copied - 1;
+			goto insn_emitted;
+		}
+
+		if (meta->packet_imm_valid) {
+			knod_iset64(&p64[0], (u64)meta->packet_imm);
+			knod_mov64(priv, meta, bpf_reg64[d], p64[0]);
+			goto insn_emitted;
+		}
+
 		if (meta->percpu_rmw_add) {
 			knod_bpf_emit_percpu_add(priv, meta);
 			goto insn_emitted;
@@ -7125,6 +11595,7 @@ static int knod_bpf_jit(struct knod_dev *knodev,
 		 * offset should not be minus.
 		 */
 		case BPF_ALU | BPF_MOV | BPF_X:
+			/* Nonzero offset encodes MOVSX, not an ordinary move. */
 			if (off)
 				return -EOPNOTSUPP;
 			knod_mov32(priv, meta, bpf_reg64[d].lo, bpf_reg64[s].lo);
@@ -7134,7 +11605,6 @@ static int knod_bpf_jit(struct knod_dev *knodev,
 		case BPF_ALU64 | BPF_MOV | BPF_X:
 			if (off)
 				return -EOPNOTSUPP;
-			//r[d] = r[s];
 			knod_mov64(priv, meta, bpf_reg64[d], bpf_reg64[s]);
 			break;
 		case BPF_ALU | BPF_MOV | BPF_K:
@@ -7142,7 +11612,6 @@ static int knod_bpf_jit(struct knod_dev *knodev,
 			knod_mov64(priv, meta, bpf_reg64[d], p64[0]);
 			break;
 		case BPF_ALU64 | BPF_MOV | BPF_K:
-			//r[d] = imm;
 			knod_iset64(&p64[0], imm);
 			knod_mov64(priv, meta, bpf_reg64[d], p64[0]);
 			break;
@@ -7515,8 +11984,11 @@ static int knod_bpf_jit(struct knod_dev *knodev,
 				WARN_ON_ONCE(1);
 			}
 			knod_wait_vmcnt(priv, meta);
-			knod_iset32(&p32[0], 0);
-			knod_mov32(priv, meta, bpf_reg64[d].hi, p32[0]);
+			if (priv->isa_version != 10 || meta->jit_engine != 1 ||
+			    meta->ptr.type != PTR_TO_STACK) {
+				knod_iset32(&p32[0], 0);
+				knod_mov32(priv, meta, bpf_reg64[d].hi, p32[0]);
+			}
 			//ptr = (__global void *)r[s] + off;
 			//r[d] = *(__global unsigned char *)ptr;
 			break;
@@ -7555,8 +12027,11 @@ static int knod_bpf_jit(struct knod_dev *knodev,
 			}
 			//ptr = (__global void *)r[s] + off;
 			//r[d] = *(__global unsigned short *)ptr;
-			knod_iset32(&p32[0], 0);
-			knod_mov32(priv, meta, bpf_reg64[d].hi, p32[0]);
+			if (priv->isa_version != 10 || meta->jit_engine != 1 ||
+			    meta->ptr.type != PTR_TO_STACK) {
+				knod_iset32(&p32[0], 0);
+				knod_mov32(priv, meta, bpf_reg64[d].hi, p32[0]);
+			}
 			knod_wait_vmcnt(priv, meta);
 			break;
 		case BPF_LDX | BPF_MEM | BPF_W:
@@ -7617,12 +12092,15 @@ static int knod_bpf_jit(struct knod_dev *knodev,
 			}
 			//ptr = (__global void *)r[s] + off;
 			//r[d] = *(__global unsigned int *)ptr;
-			if (meta->ptr.type != PTR_TO_CTX) {
+			if (meta->ptr.type != PTR_TO_CTX &&
+			    (priv->isa_version != 10 || meta->jit_engine != 1 ||
+			    meta->ptr.type != PTR_TO_STACK)) {
 				knod_iset32(&p32[0], 0);
 				knod_mov32(priv, meta, bpf_reg64[d].hi,
 					       p32[0]);
 			}
-			knod_wait_vmcnt(priv, meta);
+			if (!meta->map_lds_head && !meta->local_wait_defer)
+				knod_wait_vmcnt(priv, meta);
 			break;
 		case BPF_LDX | BPF_MEM | BPF_DW:
 			if (meta->ptr.type == PTR_TO_STACK) {
@@ -7703,9 +12181,7 @@ static int knod_bpf_jit(struct knod_dev *knodev,
 					  bpf_reg64[s].lo,
 					  bpf_reg64[d].lo, off);
 			} else if (meta->ptr.type == PTR_TO_PACKET) {
-				knod_emit(priv, meta, global_store_byte,
-					  bpf_reg64[s].lo,
-					  bpf_reg64[d].lo, off);
+				knod_bpf_packet_store(priv, meta, 1, bpf_reg64[s].lo, d, off);
 			} else {
 				WARN_ON_ONCE(1);
 			}
@@ -7731,10 +12207,7 @@ static int knod_bpf_jit(struct knod_dev *knodev,
 					  bpf_reg64[s].lo,
 					  bpf_reg64[d].lo, off);
 			} else if (meta->ptr.type == PTR_TO_PACKET) {
-				knod_emit(priv, meta,
-					  global_store_short,
-					  bpf_reg64[s].lo,
-					  bpf_reg64[d].lo, off);
+				knod_bpf_packet_store(priv, meta, 2, bpf_reg64[s].lo, d, off);
 			} else {
 				WARN_ON_ONCE(1);
 			}
@@ -7760,10 +12233,7 @@ static int knod_bpf_jit(struct knod_dev *knodev,
 					  bpf_reg64[s].lo,
 					  bpf_reg64[d].lo, off);
 			} else if (meta->ptr.type == PTR_TO_PACKET) {
-				knod_emit(priv, meta,
-					  global_store_dword,
-					  bpf_reg64[s].lo,
-					  bpf_reg64[d].lo, off);
+				knod_bpf_packet_store(priv, meta, 4, bpf_reg64[s].lo, d, off);
 			} else {
 				WARN_ON_ONCE(1);
 			}
@@ -7789,10 +12259,7 @@ static int knod_bpf_jit(struct knod_dev *knodev,
 					  bpf_reg64[s].lo,
 					  bpf_reg64[d].lo, off);
 			} else if (meta->ptr.type == PTR_TO_PACKET) {
-				knod_emit(priv, meta,
-					  global_store_dwordx2,
-					  bpf_reg64[s].lo,
-					  bpf_reg64[d].lo, off);
+				knod_bpf_packet_store(priv, meta, 8, bpf_reg64[s].lo, d, off);
 			} else {
 				WARN_ON_ONCE(1);
 			}
@@ -8197,6 +12664,10 @@ static int knod_bpf_jit(struct knod_dev *knodev,
 			knod_bpf_emit_branch_tail(priv, meta, knod_prog, off);
 			break;
 		case BPF_JMP | BPF_JEQ | BPF_K:
+			if (knod_bpf_emit_known_zero_cmp(priv, knod_prog, meta)) {
+				knod_bpf_emit_branch_tail(priv, meta, knod_prog, off);
+				break;
+			}
 			knod_vset32(&param[0], KNOD_AMDGPU_TMP_VREG0_LO);
 			knod_iset32(&param[1], imm);
 			knod_emit(priv, meta, v_mov_b32_e32, param[0],
@@ -8619,6 +13090,10 @@ static int knod_bpf_jit(struct knod_dev *knodev,
 			knod_bpf_emit_branch_tail(priv, meta, knod_prog, off);
 			break;
 		case BPF_JMP | BPF_JNE | BPF_K:
+			if (knod_bpf_emit_known_zero_cmp(priv, knod_prog, meta)) {
+				knod_bpf_emit_branch_tail(priv, meta, knod_prog, off);
+				break;
+			}
 			knod_vset32(&param[0], KNOD_AMDGPU_TMP_VREG0_LO);
 			knod_iset32(&param[1], imm);
 			knod_emit(priv, meta, v_mov_b32_e32, param[0],
@@ -8811,6 +13286,9 @@ static int knod_bpf_jit(struct knod_dev *knodev,
 		}
 
 insn_emitted:
+
+		if (meta->map_region.error || meta->sr.error || (meta->sr.owner && meta->sr.cursor != meta->sr.count))
+			return -EINVAL; /* Discard incomplete capture generation. */
 		WARN_ON(meta->amdgpu_insns >= KNOD_META_INSNS);
 		insn_idx += knod_meta_bytes(meta) / 4;
 	}

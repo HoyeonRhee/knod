@@ -36,6 +36,16 @@
 #define KNOD_BLOB_LINK_SPLICE	0
 #define KNOD_BLOB_LINK_CALL	1
 
+/* Optional LOOKUP_HASH_PRELOADED inputs, set after staging the key.
+ * The key and all result/clobber registers retain the ordinary splice ABI.
+ * Bucket contents, links and keys are still read coherently by the routine.
+ */
+#define KNOD_BLOB_HASH_PRE_ELEMS_VREG KNOD_BLOB_SPLICE_TMP_VREG
+#define KNOD_BLOB_HASH_PRE_BUCKET_VREG (KNOD_BLOB_SPLICE_TMP_VREG_END - 1)
+#define KNOD_BLOB_HASH_PRE_SEED_SREG KNOD_BLOB_SPLICE_TMP_SREG
+#define KNOD_BLOB_HASH_PRE_MASK_SREG (KNOD_BLOB_SPLICE_TMP_SREG + 3)
+#define KNOD_BLOB_HASH_PRE_STRIDE_SREG KNOD_BLOB_SPLICE_DESC_SREG
+
 #ifndef __ASSEMBLY__
 
 /*
@@ -81,6 +91,7 @@ enum knod_blob_kind {
 	 * key_chunks says which, matching enum knod_ipsec_bench_kernel.
 	 */
 	KNOD_BLOB_IPSEC_BENCH,
+	KNOD_BLOB_LOOKUP_HASH_PRELOADED,
 	KNOD_BLOB_KIND_MAX,
 };
 

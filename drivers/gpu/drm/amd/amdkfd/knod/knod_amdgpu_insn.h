@@ -1529,6 +1529,99 @@ static inline void emit_scratch_store_dword(int version,
 /* LDS, with the whole sixteen-bit offset: DS_*_B32 reads offset1:offset0 as
  * one number, and the per-generation _off helpers fill only the low byte.
  */
+/* GFX10 only: callers retain existing lowering on other generations. */
+static inline void emit_ds_read_u8(int version, struct amdgcn_insn *insn,
+		struct amdgcn_param32 dst, struct amdgcn_param32 addr, u16 off)
+{
+	WARN_ON(dst.type != AMDGCN_PARAM_TYPE_VGPR ||
+		addr.type != AMDGCN_PARAM_TYPE_VGPR);
+	if (version != 10) {
+		WARN_ON_ONCE(1);
+		return;
+	}
+	insn->size = emit_gfx10_ds_read_u8_off16(&insn->gfx10,
+		dst.v, addr.v, off);
+	insn->type = AMDGCN_INSN_TYPE_DS;
+}
+
+/* GFX10 only: callers retain existing lowering on other generations. */
+static inline void emit_ds_read_u16(int version, struct amdgcn_insn *insn,
+		struct amdgcn_param32 dst, struct amdgcn_param32 addr, u16 off)
+{
+	WARN_ON(dst.type != AMDGCN_PARAM_TYPE_VGPR ||
+		addr.type != AMDGCN_PARAM_TYPE_VGPR);
+	if (version != 10) {
+		WARN_ON_ONCE(1);
+		return;
+	}
+	insn->size = emit_gfx10_ds_read_u16_off16(&insn->gfx10,
+		dst.v, addr.v, off);
+	insn->type = AMDGCN_INSN_TYPE_DS;
+}
+
+/* GFX10 only: callers retain existing lowering on other generations. */
+static inline void emit_ds_write_b8(int version, struct amdgcn_insn *insn,
+		struct amdgcn_param32 addr, struct amdgcn_param32 src, u16 off)
+{
+	WARN_ON(addr.type != AMDGCN_PARAM_TYPE_VGPR ||
+		src.type != AMDGCN_PARAM_TYPE_VGPR);
+	if (version != 10) {
+		WARN_ON_ONCE(1);
+		return;
+	}
+	insn->size = emit_gfx10_ds_write_b8_off16(&insn->gfx10,
+		addr.v, src.v, off);
+	insn->type = AMDGCN_INSN_TYPE_DS;
+}
+
+/* GFX10 only: callers retain existing lowering on other generations. */
+static inline void emit_ds_write_b16(int version, struct amdgcn_insn *insn,
+		struct amdgcn_param32 addr, struct amdgcn_param32 src, u16 off)
+{
+	WARN_ON(addr.type != AMDGCN_PARAM_TYPE_VGPR ||
+		src.type != AMDGCN_PARAM_TYPE_VGPR);
+	if (version != 10) {
+		WARN_ON_ONCE(1);
+		return;
+	}
+	insn->size = emit_gfx10_ds_write_b16_off16(&insn->gfx10,
+		addr.v, src.v, off);
+	insn->type = AMDGCN_INSN_TYPE_DS;
+}
+
+/* GFX10 only; callers retain scalar DS lowering on other targets. */
+static inline void emit_ds_read2st64_b32(int version, struct amdgcn_insn *insn,
+		struct amdgcn_param32 dst, struct amdgcn_param32 addr, u16 off0, u16 off1)
+{
+	if (WARN_ON(version != 10 || dst.type != AMDGCN_PARAM_TYPE_VGPR ||
+		    addr.type != AMDGCN_PARAM_TYPE_VGPR || dst.v >= 255 ||
+		    off0 > 255 || off1 > 255 || off0 == off1))
+		return;
+	__emit_gfx10_ds(&insn->gfx10, GFX10_DS_READ2ST64_B32,
+		         addr.v, 0, dst.v, off0, off1);
+	insn->gfx10.ds.data1 = 0;
+	insn->gfx10.ds.dummy = 0;
+	insn->size = 8;
+	insn->type = AMDGCN_INSN_TYPE_DS;
+}
+
+static inline void emit_ds_write2st64_b32(int version, struct amdgcn_insn *insn,
+		struct amdgcn_param32 addr, struct amdgcn_param32 src0,
+		struct amdgcn_param32 src1, u16 off0, u16 off1)
+{
+	if (WARN_ON(version != 10 || addr.type != AMDGCN_PARAM_TYPE_VGPR ||
+		    src0.type != AMDGCN_PARAM_TYPE_VGPR ||
+		    src1.type != AMDGCN_PARAM_TYPE_VGPR ||
+		    off0 > 255 || off1 > 255 || off0 == off1))
+		return;
+	__emit_gfx10_ds(&insn->gfx10, GFX10_DS_WRITE2ST64_B32,
+		         addr.v, src0.v, 0, off0, off1);
+	insn->gfx10.ds.data1 = src1.v;
+	insn->gfx10.ds.dummy = 0;
+	insn->size = 8;
+	insn->type = AMDGCN_INSN_TYPE_DS;
+}
+
 static inline void emit_ds_read_b32(int version, struct amdgcn_insn *insn,
 				    struct amdgcn_param32 dst,
 				    struct amdgcn_param32 addr, u16 off)
@@ -1627,6 +1720,25 @@ static inline void emit_global_load_dwordx2(int version,
 	} else if (version == 9) {
 		insn->size = emit_gfx9_global_load_dwordx2(&insn->gfx9,
 							   dst, src, off);
+		insn->type = AMDGCN_INSN_TYPE_FLAT;
+	} else {
+		WARN_ON_ONCE(1);
+	}
+}
+
+static inline void emit_global_load_dwordx3(int version,
+				     struct amdgcn_insn *insn,
+				     struct amdgcn_param32 dst,
+				     struct amdgcn_param32 src,
+				     short off)
+{
+	if (version == 11) {
+		insn->size = emit_gfx11_global_load_dwordx3(&insn->gfx11,
+							    dst, src, off);
+		insn->type = AMDGCN_INSN_TYPE_FLAT;
+	} else if (version == 10) {
+		insn->size = emit_gfx10_global_load_dwordx3(&insn->gfx10,
+							    dst, src, off);
 		insn->type = AMDGCN_INSN_TYPE_FLAT;
 	} else {
 		WARN_ON_ONCE(1);
@@ -1775,6 +1887,24 @@ static inline void emit_global_store_dwordx2(int version,
 	} else if (version == 9) {
 		insn->size = emit_gfx9_global_store_dwordx2(&insn->gfx9,
 							    src, dst, off);
+		insn->type = AMDGCN_INSN_TYPE_FLAT;
+	} else {
+		WARN_ON_ONCE(1);
+	}
+}
+
+static inline void emit_global_store_dwordx3(int version,
+				      struct amdgcn_insn *insn,
+				      struct amdgcn_param32 dst,
+				      struct amdgcn_param32 src, int off)
+{
+	if (version == 11) {
+		insn->size = emit_gfx11_global_store_dwordx3(&insn->gfx11,
+							     src, dst, off);
+		insn->type = AMDGCN_INSN_TYPE_FLAT;
+	} else if (version == 10) {
+		insn->size = emit_gfx10_global_store_dwordx3(&insn->gfx10,
+							     src, dst, off);
 		insn->type = AMDGCN_INSN_TYPE_FLAT;
 	} else {
 		WARN_ON_ONCE(1);
@@ -2239,5 +2369,6 @@ static inline void debugfs_insn(struct amdgcn_insn *insn, struct seq_file *m)
 		seq_printf(m, "%08x ", dw[i]);
 	seq_putc(m, '\n');
 }
+
 
 #endif

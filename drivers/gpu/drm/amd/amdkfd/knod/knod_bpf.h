@@ -276,7 +276,146 @@ enum knod_branch_type {
 
 #define KNOD_META_INSNS		1024
 #define AMDGPU_INSN_SKIP	-1
+#include "knod_bpf_memory.h"
+
+/* A proved packet-copy group; zero bytes means ordinary BPF lowering.
+ * No target registers or GPU instructions belong in this description.
+ */
+struct knod_bpf_copy {
+	s16 src_off;
+	s16 dst_off;
+	u8 bytes;
+	u8 last_byte;
+	u8 base_reg;
+	u8 value_reg;
+	bool result_dead; /* Only proven dead live-out values may omit restore. */
+};
+
+struct knod_bpf_store {
+	s16 off;
+	u8 bytes;
+	u8 base_reg;
+	u8 value_reg[16];
+};
+
+struct knod_bpf_conststore {
+	s16 off;
+	u8 base, bytes;
+	u8 data[16];
+	bool elide;
+};
+
+struct knod_bpf_store_hoist {
+	s16 off;
+	u8 base, reg[2];
+	bool emit, elide;
+};
+
+/* Compile-time byte provenance, never a runtime instruction stream. */
+enum knod_region_value_kind {
+	KNOD_REGION_ENTRY, KNOD_REGION_PACKET, KNOD_REGION_IMM,
+};
+struct knod_region_value {
+	u64 imm;
+	s16 off;
+	u8 kind, reg;
+};
+struct knod_bpf_packet_region {
+	u8 count, base, bytes, input_bytes;
+	s16 off, input_off;
+	u16 changed;
+	struct knod_region_value output[16], final[10];
+};
+
+struct knod_bpf_sink_value { u8 source, shift; bool saved; };
+struct knod_bpf_sink {
+	s16 off;
+	u8 bytes, base, capture, capture_reg;
+	bool member, forward;
+	struct knod_bpf_sink_value value[16];
+};
+
+/* Adjacent selected groups; pointers are owned by this program's metas. */
+struct knod_bpf_map_region {
+	struct knod_insn_meta *region, *producer;
+	bool staged, error;
+};
+
+struct knod_bpf_map_widen { u8 count, dst[8]; bool owned; };
+
+struct knod_bpf_wide_read {
+	s16 off;
+	u8 offset, width, base, bytes;
+	bool owned, load, first, half_phase;
+};
+
+struct knod_bpf_read_batch {
+	s16 off[8];
+	u8 width[8], base, slot, count;
+	bool owned, load, first;
+};
+
+struct knod_bpf_load_pair { s16 off; u8 base, word; bool first, last, owned; };
+
+#define SR_NODES 96
+#define SR_STORES 8
+#define SR_BYTES 40
+#define SR_WORDS 10
+struct sr_node {
+	u8 successor_count, successor[2];
+	bool outside_entry, forbidden, unresolved_overlap_read, base_changed;
+	/* Last node covered by an already-selected opaque group, or self. */
+	u8 group_last;
+};
+struct sr_store {
+	u8 node, width, base, ordinal;
+	s16 offset;
+};
+struct sr_capture {
+	struct sr_store store;
+	u8 first_slot;
+};
+struct sr_byte {
+	u8 slot, shift;
+};
+struct sr_plan {
+	u8 count, slots, bytes, base, flush_node, flush_count;
+	s16 offset;
+	struct sr_capture capture[SR_STORES];
+	struct sr_byte byte[SR_BYTES];
+};
+struct sr_scratch {
+	u64 dom[SR_NODES][2], post[SR_NODES][2];
+	bool reached[SR_NODES];
+	struct sr_plan draft;
+};
+struct knod_sr_meta { struct knod_insn_meta *owner; struct sr_plan plan; u8 first,count,cursor; bool error; };
+
 struct knod_insn_meta {
+	bool percpu_delta_direct;
+	bool map_lds_head, map_lds_tail;
+	struct knod_sr_meta sr;
+	struct knod_bpf_load_pair load_pair;
+	struct knod_bpf_read_batch read_batch;
+	struct knod_bpf_wide_read wide_read;
+	struct knod_bpf_map_widen map_widen;
+	struct knod_bpf_map_region map_region;
+	u8 jit_engine;
+	struct knod_memory_load_group loads;
+	struct knod_bpf_sink sink;
+	struct knod_bpf_store_hoist store_hoist;
+	struct knod_bpf_conststore conststore;
+	struct knod_bpf_packet_region packet_region;
+	bool memory_group_owned;
+	bool local_wait_member, local_wait_defer;
+	u8 local_issue_count, local_issue_order[8];
+	/* One certified merge-read group; role 1 issues, role 2 retains EXEC only. */
+	struct { s16 off; u8 dst, role; } merge_read;
+	u32 packet_imm;
+	bool packet_imm_valid;
+	struct knod_bpf_copy copy;
+	struct knod_bpf_store store;
+
 	struct bpf_insn insn;
 	short bpf_insn_idx;
 
@@ -287,10 +426,14 @@ struct knod_insn_meta {
 	 */
 	struct knod_insn_meta *percpu_rmw_add;
 	bool percpu_rmw_swapped;
+	bool percpu_dead;
 	/* Every lane reaches the same element, so the wave can send one atomic
 	 * between them instead of one each.
 	 */
 	bool percpu_rmw_uniform;
+	bool percpu_addr_proven;
+	bool array_key_proven;
+	u32 array_key_literal;
 
 	/* A routine spliced in whole.  The JIT does not look inside it: it only
 	 * has to know how many bytes it added, because the offsets every branch
@@ -397,6 +540,8 @@ struct knod_insn_meta {
 struct knod_bb;		/* basic-block CFG analysis (knod_bpf.c) */
 
 struct knod_prog {
+	u8 jit_engine;
+	bool wide_read_xdp;
 	struct knod *knod;
 	struct knod_dev *knodev;
 

@@ -3085,6 +3085,30 @@ inline u32 emit_gfx10_global_load_dwordx2(union amdgcn_gfx10_insn *insn,
 	return 8;
 }
 
+inline u32 emit_gfx10_global_load_dwordx3(union amdgcn_gfx10_insn *insn,
+					  struct amdgcn_param32 dst,
+					  struct amdgcn_param32 src,
+					  short off)
+{
+	/* global_load_dwordx3 <dst>, <srcs>, off offset:<off> */
+	insn->flat.offset = off;
+	insn->flat.dlc = 0;
+	insn->flat.lds = 0;
+	insn->flat.seg = GFX10_FLAT_SEG_GLOBAL;
+	insn->flat.glc = 0;
+	insn->flat.slc = 0;
+	insn->flat.op = GFX10_GLOBAL_LOAD_DWORDX3;
+	insn->flat.encoding = GFX10_FLAT_ENCODING;
+	insn->flat.addr = src.v;
+	insn->flat.data = 0;
+	insn->flat.saddr = GFX10_FLAT_SADDR_DISABLE;
+	insn->flat.dummy1 = 0;
+	insn->flat.dummy2 = 0;
+	insn->flat.vdst = dst.v;
+
+	return 8;
+}
+
 inline u32 emit_gfx10_global_load_dwordx4(union amdgcn_gfx10_insn *insn,
 					  struct amdgcn_param32 dst,
 					  struct amdgcn_param32 src,
@@ -3239,6 +3263,31 @@ inline u32 emit_gfx10_global_store_dwordx2(union amdgcn_gfx10_insn *insn,
 	insn->flat.glc = 1;
 	insn->flat.slc = 1;
 	insn->flat.op = GFX10_GLOBAL_STORE_DWORDX2;
+	insn->flat.encoding = GFX10_FLAT_ENCODING;
+	insn->flat.addr = dst.v;
+	insn->flat.data = src.v;
+	insn->flat.saddr = GFX10_FLAT_SADDR_DISABLE;
+	insn->flat.dummy1 = 0;
+	insn->flat.dummy2 = 0;
+	insn->flat.vdst = 0;
+
+	return 8;
+}
+
+inline u32 emit_gfx10_global_store_dwordx3(union amdgcn_gfx10_insn *insn,
+					   struct amdgcn_param32 dst,
+					   struct amdgcn_param32 src, int off)
+{
+	/* global_store_dwordx3 <src>, <dst>, off offset:<off>
+	 * *(char *)(dst + off) = src;
+	 */
+	insn->flat.offset = off;
+	insn->flat.dlc = 0;
+	insn->flat.lds = 0;
+	insn->flat.seg = GFX10_FLAT_SEG_GLOBAL;
+	insn->flat.glc = 1;
+	insn->flat.slc = 1;
+	insn->flat.op = GFX10_GLOBAL_STORE_DWORDX3;
 	insn->flat.encoding = GFX10_FLAT_ENCODING;
 	insn->flat.addr = dst.v;
 	insn->flat.data = src.v;
@@ -3912,6 +3961,34 @@ inline u32 emit_gfx10_v_perm_b32(union amdgcn_gfx10_insn *insn,
 }
 
 /* --- GFX10 DS --- */
+
+static inline u32 emit_gfx10_ds_read_u8_off16(union amdgcn_gfx10_insn *insn,
+		int dst, int addr, u16 off)
+{
+	__emit_gfx10_ds(insn, GFX10_DS_READ_U8, addr, 0, dst, off & 0xff, off >> 8);
+	return 8;
+}
+
+static inline u32 emit_gfx10_ds_read_u16_off16(union amdgcn_gfx10_insn *insn,
+		int dst, int addr, u16 off)
+{
+	__emit_gfx10_ds(insn, GFX10_DS_READ_U16, addr, 0, dst, off & 0xff, off >> 8);
+	return 8;
+}
+
+static inline u32 emit_gfx10_ds_write_b8_off16(union amdgcn_gfx10_insn *insn,
+		int addr, int src, u16 off)
+{
+	__emit_gfx10_ds(insn, GFX10_DS_WRITE_B8, addr, src, 0, off & 0xff, off >> 8);
+	return 8;
+}
+
+static inline u32 emit_gfx10_ds_write_b16_off16(union amdgcn_gfx10_insn *insn,
+		int addr, int src, u16 off)
+{
+	__emit_gfx10_ds(insn, GFX10_DS_WRITE_B16, addr, src, 0, off & 0xff, off >> 8);
+	return 8;
+}
 
 inline u32 emit_gfx10_ds_write_b32(union amdgcn_gfx10_insn *insn,
 				     int addr, int data0)
