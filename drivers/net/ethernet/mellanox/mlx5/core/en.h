@@ -748,6 +748,7 @@ struct mlx5e_rq {
 	bool                   knod_spsc_prod_valid;
 	/* Admission reduced the requested RX budget; CQE presence is unknown. */
 	bool                   knod_rx_budget_limited;
+	u16                    knod_rx_padding;
 
 	/* AF_XDP zero-copy */
 	struct xsk_buff_pool  *xsk_pool;

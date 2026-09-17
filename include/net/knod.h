@@ -95,6 +95,7 @@ struct page_pool_hostmem {
 };
 
 struct knod_work_priv {
+	u32 rx_geometry; /* RX prefix padding and slot size; immutable while open */
 	struct dma_buf *dmabuf;
 	netmem_ref *netmems;
 	unsigned int *data_lens;

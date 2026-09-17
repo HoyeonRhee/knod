@@ -240,8 +240,21 @@ int knod_d2h_copy(struct knod_dev *knodev, int napi_index,
 		void *ptr;
 		u32 fv;
 		u16 off = bds[i].off;
+		u16 dst_off = off;
+		u32 geometry = READ_ONCE(wpriv->rx_geometry);
 		u16 len = bds[i].len;
 
+		/* Placement padding and earlier slots are not host skb headroom. */
+		if (geometry) {
+			u32 size = geometry >> 16;
+			u32 padding = geometry & 0xffff;
+			u32 relative = off & (size - 1);
+
+			if (relative < padding ||
+			    relative + len > SKB_WITH_OVERHEAD(size))
+				goto drop;
+			dst_off = relative - padding;
+		}
 		if (!len || off + len > SKB_WITH_OVERHEAD(PAGE_SIZE))
 			goto drop;
 		if (spsc_produce(&wpriv->pass_pending, &ptr)) {
@@ -255,7 +268,7 @@ int knod_d2h_copy(struct knod_dev *knodev, int napi_index,
 		}
 
 		fv = ops->d2h_submit(knodev,
-				     page_pool_get_dma_addr_netmem(dst) + off,
+				     page_pool_get_dma_addr_netmem(dst) + dst_off,
 				     napi_index, bds[i].page_idx, off, len);
 		if (!fv) {		/* SDMA ring full: backpressure drop */
 			page_pool_put_full_netmem(pool, dst, false);
@@ -267,7 +280,7 @@ int knod_d2h_copy(struct knod_dev *knodev, int napi_index,
 		desc = ptr;
 		desc->netmem = dst;
 		desc->src = src;
-		desc->off = off;
+		desc->off = dst_off;
 		desc->len = len;
 		desc->fence_val = fv;
 		desc->sdma_idx = 0;

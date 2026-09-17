@@ -892,6 +892,70 @@ static void mlx5e_rq_free_shampo(struct mlx5e_rq *rq)
 	kvfree(shampo);
 }
 
+static unsigned int knod_rx_offset_base;
+module_param_named(knod_rx_offset_base, knod_rx_offset_base, uint, 0644);
+MODULE_PARM_DESC(knod_rx_offset_base, "Unused KNOD RX prefix padding applied when queues open");
+static unsigned int knod_rx_offset_step;
+module_param_named(knod_rx_offset_step, knod_rx_offset_step, uint, 0644);
+MODULE_PARM_DESC(knod_rx_offset_step, "Unused RX prefix padding per queue in an offset period");
+
+static unsigned int knod_rx_offset_period = 8;
+module_param_named(knod_rx_offset_period, knod_rx_offset_period, uint, 0644);
+MODULE_PARM_DESC(knod_rx_offset_period, "Queue count before RX offset repeats (1-8)");
+
+static int mlx5e_knod_rx_padding(struct mlx5e_params *params,
+				 struct mlx5e_rq_opt_param *rqo,
+				 struct mlx5e_rq *rq)
+{
+	u32 base = READ_ONCE(knod_rx_offset_base);
+	u32 step = READ_ONCE(knod_rx_offset_step);
+	u32 period = READ_ONCE(knod_rx_offset_period);
+	u32 padding, required;
+
+	if (!rq->knodev)
+		return 0;
+	if (!period || period > 8 || base > 2048 || step > 2048 ||
+	    (base | step) & 63)
+		return -EINVAL;
+	if (base || step) {
+		/* Keep the existing allocation geometry. Only linear packet
+		 * slots can reserve unused prefix padding.
+		 */
+		if (mlx5e_rqo_xsk_param(rqo) ||
+		    test_bit(MLX5E_RQ_STATE_SHAMPO, &rq->state) ||
+		    (rq->wq_type == MLX5_WQ_TYPE_CYCLIC &&
+		     rq->wqe.info.num_frags != 1))
+			return -EOPNOTSUPP;
+		if (rq->wq_type == MLX5_WQ_TYPE_LINKED_LIST_STRIDING_RQ &&
+		    (!mlx5e_rx_mpwqe_is_linear_skb(rq->mdev, params, rqo) ||
+		     rq->mpwqe.page_shift != PAGE_SHIFT))
+			return -EOPNOTSUPP;
+		padding = base + (rq->ix % period) * step;
+		required = padding + MLX5_SKB_FRAG_SZ(rq->buff.headroom +
+					 MLX5E_SW2HW_MTU(params, params->sw_mtu));
+		if (!rq->buff.frame0_sz || rq->buff.frame0_sz > PAGE_SIZE ||
+		    PAGE_SIZE % rq->buff.frame0_sz ||
+		    required > rq->buff.frame0_sz)
+			return -EINVAL;
+		rq->knod_rx_padding = padding;
+	}
+	/* Published before RX descriptors; copied into each dispatch parameter.
+	 * Low 16 bits are inaccessible prefix padding, high 16 bits slot size.
+	 */
+	rq->knodev->wpriv[rq->ix].rx_geometry =
+		is_power_of_2(rq->buff.frame0_sz) && rq->buff.frame0_sz <= PAGE_SIZE &&
+		((rq->wq_type == MLX5_WQ_TYPE_CYCLIC && rq->wqe.info.num_frags == 1) ||
+		 (rq->wq_type == MLX5_WQ_TYPE_LINKED_LIST_STRIDING_RQ &&
+		  mlx5e_rx_mpwqe_is_linear_skb(rq->mdev, params, rqo) &&
+		  rq->mpwqe.page_shift == PAGE_SHIFT)) ?
+		(rq->buff.frame0_sz << 16) | rq->knod_rx_padding : 0;
+	netdev_info(rq->netdev,
+		    "knod-offset q=%u headroom=%u stride=%u type=%u base=%u step=%u padding=%u\n",
+		    rq->ix, rq->buff.headroom, rq->buff.frame0_sz,
+		    rq->wq_type, base, step, rq->knod_rx_padding);
+	return 0;
+}
+
 static int mlx5e_alloc_rq(struct mlx5e_params *params,
 			  struct mlx5e_rq_param *rq_param,
 			  struct mlx5e_rq_opt_param *rqo,
@@ -995,6 +1059,10 @@ static int mlx5e_alloc_rq(struct mlx5e_params *params,
 			goto err_rq_wq_destroy;
 	}
 
+	err = mlx5e_knod_rx_padding(params, rqo, rq);
+	if (err)
+		goto err_free_by_rq_type;
+
 	if (mlx5e_rqo_xsk_param(rqo)) {
 		err = xdp_rxq_info_reg_mem_model(&rq->xdp_rxq,
 						 MEM_TYPE_XSK_BUFF_POOL, NULL);
@@ -1056,7 +1124,7 @@ static int mlx5e_alloc_rq(struct mlx5e_params *params,
 			u64 dma_offset = mul_u32_u32(i, rq->mpwqe.mtts_per_wqe) <<
 				rq->mpwqe.page_shift;
 			u16 headroom = test_bit(MLX5E_RQ_STATE_SHAMPO, &rq->state) ?
-				       0 : rq->buff.headroom;
+				       0 : rq->buff.headroom + rq->knod_rx_padding;
 
 			wqe->data[0].addr = cpu_to_be64(dma_offset + headroom);
 			wqe->data[0].byte_count = cpu_to_be32(byte_count);

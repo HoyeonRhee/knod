@@ -394,7 +394,7 @@ static int mlx5e_alloc_rx_wqe(struct mlx5e_rq *rq, struct mlx5e_rx_wqe_cyc *wqe,
 
 		frag->flags &= ~BIT(MLX5E_WQE_FRAG_SKIP_RELEASE);
 
-		headroom = i == 0 ? rq->buff.headroom : 0;
+		headroom = i == 0 ? rq->buff.headroom + rq->knod_rx_padding : 0;
 		addr = page_pool_get_dma_addr_netmem(frag->frag_page->netmem);
 		wqe->data[i].addr = cpu_to_be64(addr + frag->offset + headroom);
 	}
@@ -1653,7 +1653,7 @@ mlx5e_skb_from_cqe_linear(struct mlx5e_rq *rq, struct mlx5e_wqe_frag_info *wi,
 		bd->netmem = frag_page->netmem;
 		bd->pp = frag_page->pp;
 		bd->len = cqe_bcnt;
-		bd->off = wi->offset + rx_headroom;
+		bd->off = wi->offset + rq->knod_rx_padding + rx_headroom;
 		bd->page_idx = frag_page->page_idx;
 		frag_page->frags++;
 		rq->stats->packets++;
@@ -2209,7 +2209,7 @@ mlx5e_skb_from_cqe_mpwrq_linear(struct mlx5e_rq *rq, struct mlx5e_mpw_info *wi,
 		bd->netmem = frag_page->netmem;
 		bd->pp = frag_page->pp;
 		bd->len = cqe_bcnt;
-		bd->off = head_offset + rx_headroom;
+		bd->off = head_offset + rq->knod_rx_padding + rx_headroom;
 		bd->page_idx = frag_page->page_idx;
 		frag_page->frags++;
 		rq->stats->packets++;
