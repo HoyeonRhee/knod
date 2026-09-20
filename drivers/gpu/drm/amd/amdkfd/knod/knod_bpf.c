@@ -4145,6 +4145,63 @@ static void knod_map_bypass_l0(struct knod_bpf_priv *priv,
 	}
 }
 
+/* Apply the RDNA NC packet-store policy only to ranges the verifier proved
+ * access packet memory. Loads and unrelated memory retain their existing
+ * cache policy. GFX11 stores are device scope regardless of GLC, but keep the
+ * explicit GLC/SLC/DLC policy paired with the generation-specific encoding.
+ */
+static void knod_packet_store_cache_policy(struct knod_bpf_priv *priv,
+					   struct knod_insn_meta *meta,
+					   u32 first)
+{
+	u32 i;
+
+	if ((priv->isa_version != 10 && priv->isa_version != 11) ||
+	    knod_bpf_jit_engine != 1)
+		return;
+	for (i = first; i < meta->amdgpu_insns; i++) {
+		struct amdgcn_insn *insn = &meta->amdgpu_insn[i];
+
+		if (insn->type != AMDGCN_INSN_TYPE_FLAT)
+			continue;
+		if (priv->isa_version == 11) {
+			if (insn->gfx11.flat.seg != GFX11_FLAT_SEG_GLOBAL)
+				continue;
+			switch (insn->gfx11.flat.op) {
+			case GFX11_GLOBAL_STORE_B8:
+			case GFX11_GLOBAL_STORE_B16:
+			case GFX11_GLOBAL_STORE_B32:
+			case GFX11_GLOBAL_STORE_B64:
+			case GFX11_GLOBAL_STORE_B96:
+			case GFX11_GLOBAL_STORE_B128:
+				insn->gfx11.flat.glc = 1;
+				insn->gfx11.flat.slc = 0;
+				insn->gfx11.flat.dlc = 1;
+				break;
+			default:
+				break;
+			}
+		} else {
+			if (insn->gfx10.flat.seg != GFX10_FLAT_SEG_GLOBAL)
+				continue;
+			switch (insn->gfx10.flat.op) {
+			case GFX10_GLOBAL_STORE_BYTE:
+			case GFX10_GLOBAL_STORE_SHORT:
+			case GFX10_GLOBAL_STORE_DWORD:
+			case GFX10_GLOBAL_STORE_DWORDX2:
+			case GFX10_GLOBAL_STORE_DWORDX3:
+			case GFX10_GLOBAL_STORE_DWORDX4:
+				insn->gfx10.flat.glc = 1;
+				insn->gfx10.flat.slc = 0;
+				insn->gfx10.flat.dlc = 1;
+				break;
+			default:
+				break;
+			}
+		}
+	}
+}
+
 static void knod_wait_vmcnt(struct knod_bpf_priv *priv,
 			   struct knod_insn_meta *meta)
 {
@@ -8704,6 +8761,8 @@ static int knod_bpf_jit(struct knod_dev *knodev,
 		}
 
 insn_emitted:
+		if (meta->ptr.type == PTR_TO_PACKET)
+			knod_packet_store_cache_policy(priv, meta, 0);
 		WARN_ON(meta->amdgpu_insns >= KNOD_META_INSNS);
 		insn_idx += knod_meta_bytes(meta) / 4;
 	}
