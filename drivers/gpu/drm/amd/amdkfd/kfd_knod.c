@@ -51,6 +51,7 @@
 #include <drm/ttm/ttm_tt.h>
 #include <linux/seq_file.h>
 #include "knod_bpf.h"
+#include "knod_persistent.h"
 #include <net/page_pool/helpers.h>
 #include <linux/netdevice.h>
 #include <linux/firmware.h>
@@ -857,9 +858,12 @@ err_mem:
 int knod_blob_load(struct knod *knod, struct knod_blob *blob, const char *what)
 {
 	const struct knod_blob_hdr *hdr;
+	const struct knod_blob_entry *entries;
 	const struct firmware *fw;
 	char name[40];
+	u32 entry_offset, n_entries;
 	size_t need;
+	u32 i;
 	int err;
 
 	snprintf(name, sizeof(name), "knod/knod-%s-gfx%d.bin", what,
@@ -883,22 +887,47 @@ int knod_blob_load(struct knod *knod, struct knod_blob *blob, const char *what)
 			KNOD_BLOB_ABI_VERSION);
 		goto out;
 	}
+	if (le32_to_cpu(hdr->reserved) !=
+	    (!strcmp(what, "bpf-persistent") ? KNOD_PERSIST_VERSION : 0))
+		goto out;
+
 	if (le32_to_cpu(hdr->isa) != (u32)knod->isa_version) {
 		pr_warn("knod: %s was built for gfx%u\n", name,
 			le32_to_cpu(hdr->isa));
+		goto out;
+	}
+	if (!strcmp(what, "bpf-persistent") &&
+	    (le32_to_cpu(hdr->link_mode) != KNOD_BLOB_LINK_SPLICE ||
+	     le32_to_cpu(hdr->wave_size) != 64)) {
+		pr_warn("knod: %s must use SPLICE linkage and Wave64\n", name);
 		goto out;
 	}
 
 	/* The entry table is reached through the header, so check it lands
 	 * inside the file before trusting anything it says.
 	 */
-	need = le32_to_cpu(hdr->entry_offset) +
-	       array_size(le32_to_cpu(hdr->n_entries),
-			  sizeof(struct knod_blob_entry));
-	if (need > fw->size) {
+	entry_offset = le32_to_cpu(hdr->entry_offset);
+	n_entries = le32_to_cpu(hdr->n_entries);
+	if (entry_offset > fw->size ||
+	    n_entries > (fw->size - entry_offset) /
+			 sizeof(struct knod_blob_entry)) {
 		pr_warn("knod: %s claims %u entries it does not hold\n",
-			name, le32_to_cpu(hdr->n_entries));
+			name, n_entries);
 		goto out;
+	}
+	need = entry_offset + array_size(n_entries,
+					 sizeof(struct knod_blob_entry));
+	entries = (const void *)fw->data + entry_offset;
+	for (i = 0; i < n_entries; i++) {
+		u32 off = le32_to_cpu(entries[i].code_offset);
+		u32 len = le32_to_cpu(entries[i].code_size);
+
+		if (!len || len % sizeof(u32) || off < need ||
+		    off > fw->size || len > fw->size - off) {
+			pr_warn("knod: %s entry %u is outside its code area\n",
+				name, i);
+			goto out;
+		}
 	}
 
 	blob->hdr = kmemdup(fw->data, fw->size, GFP_KERNEL);
@@ -1134,15 +1163,6 @@ void knod_unregister_worker(struct knod *knod)
 	knod_start_default_worker(knod);
 }
 
-int knod_wait_on_events(struct kfd_process *p, u32 num_events,
-			void __user *data, bool all, u32 *user_timeout_ms,
-			u32 *wait_result)
-{
-	return kfd_wait_on_events_kernel(p, num_events, data, all,
-					 user_timeout_ms, wait_result);
-}
-EXPORT_SYMBOL(knod_wait_on_events);
-
 static int knod_alloc_ctx_init(struct knod *knod, int id, void **doorbell,
 			       struct kfd_topology_device **out_topo_dev,
 			       struct kfd_process_device **out_pdd)
@@ -1325,7 +1345,7 @@ static int knod_stats_show(struct seq_file *s, void *unused)
 DEFINE_SHOW_ATTRIBUTE(knod_stats);
 
 /* Match the KFD queue accounting used for CWSR backing.  Keep this local to
- * KNOD so the resident-BPF admission check can use the actual generation's
+ * KNOD so the persistent-shader admission check can use the generation's
  * VGPR file size without changing generic queue policy.
  */
 static u32 knod_vgpr_size_per_cu(u32 gfxv)
@@ -1976,6 +1996,8 @@ static int knod_attach(struct knod_dev *knodev)
 	 * are allocated when the feature is selected (->activate).
 	 */
 	knod->active_feature = KNOD_FEATURE_NONE;
+	knod->coherent_control_required = false;
+	knod->control_mem_coherent = false;
 
 	/*
 	 * Permanent per-attach feature state (e.g. the BPF bpf_offload_dev,
@@ -2047,12 +2069,14 @@ static void *knod_accel_alloc_mem(struct knod_dev *knodev, size_t size,
 	 * GTT; only host-read delivery buffers need coherent CPU visibility.
 	 */
 	flags = KFD_IOC_ALLOC_MEM_FLAGS_GTT | KFD_IOC_ALLOC_MEM_FLAGS_WRITABLE;
-	if (pages)
+	if (pages || knod->coherent_control_required)
 		flags |= KFD_IOC_ALLOC_MEM_FLAGS_COHERENT;
 
 	mem = knod_alloc_mem(knod, size, flags);
 	if (IS_ERR(mem))
 		return NULL;
+	if (!pages)
+		knod->control_mem_coherent = !!(flags & KFD_IOC_ALLOC_MEM_FLAGS_COHERENT);
 
 	if (pages) {
 		tt = mem->mem->bo ? mem->mem->bo->tbo.ttm : NULL;

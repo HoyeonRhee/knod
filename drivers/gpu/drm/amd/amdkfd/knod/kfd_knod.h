@@ -154,6 +154,8 @@ static inline const char *knod_blob_kind_name(u32 kind)
 }
 
 struct knod {
+	bool coherent_control_required;
+	bool control_mem_coherent;
 	struct list_head list;
 	struct list_head active_list;
 
@@ -262,7 +264,8 @@ knod_setup_invalidate(struct knod *knod, int idx, int q_idx)
 
 static inline void
 knod_setup_dispatch(struct knod *knod, int idx,
-		    const struct knod_dispatch_params *p, int q_idx)
+		    const struct knod_dispatch_params *p, int q_idx,
+		    u64 completion_signal)
 {
 	struct hsa_kernel_dispatch_packet *dp = knod->kaql[q_idx].aql->kaddr;
 
@@ -278,7 +281,7 @@ knod_setup_dispatch(struct knod *knod, int idx,
 	dp->group_segment_size = p->group_segment_size;
 	dp->kernel_object = p->kernel_object;
 	dp->kernarg_address = (void *)p->kernarg_address;
-	dp->completion_signal = knod->kaql[q_idx].queue_signal->gaddr;
+	dp->completion_signal = completion_signal;
 	/* publish the packet body before the valid header (WRITE_ONCE below) */
 	wmb();
 	WRITE_ONCE(dp->header,
@@ -291,8 +294,9 @@ knod_setup_dispatch(struct knod *knod, int idx,
 }
 
 static inline void
-knod_setup_header(struct knod *knod,
-		  const struct knod_dispatch_params *p, int q_idx)
+knod_setup_header_signal(struct knod *knod,
+			 const struct knod_dispatch_params *p, int q_idx,
+			 u64 completion_signal)
 {
 	struct amd_queue *amd_queue = (struct amd_queue *)knod->kaql[q_idx].amd_queue->kaddr;
 	int curr_idx = knod->kaql[q_idx].idx;
@@ -300,10 +304,19 @@ knod_setup_header(struct knod *knod,
 	u64 *ptr = knod->kaql[q_idx].doorbell;
 
 	knod_setup_invalidate(knod, next_idx % knod->nr_aql_ring, q_idx);
-	knod_setup_dispatch(knod, curr_idx % knod->nr_aql_ring, p, q_idx);
+	knod_setup_dispatch(knod, curr_idx % knod->nr_aql_ring, p, q_idx,
+			    completion_signal);
 	WRITE_ONCE(amd_queue->write_dispatch_id, curr_idx);
 	writeq(curr_idx, ptr);
 	knod->kaql[q_idx].idx = next_idx;
+}
+
+static inline void
+knod_setup_header(struct knod *knod,
+		  const struct knod_dispatch_params *p, int q_idx)
+{
+	knod_setup_header_signal(knod, p, q_idx,
+				 knod->kaql[q_idx].queue_signal->gaddr);
 }
 
 #define KNOD_NR_AQL_DEFAULT   1
@@ -347,8 +360,5 @@ int knod_gart_map(struct amdgpu_device *adev, u64 npages,
 int knod_register_worker(struct knod *knod, knod_worker_fn_t fn,
 			 knod_flush_fn_t flush, void *ctx);
 void knod_unregister_worker(struct knod *knod);
-int knod_wait_on_events(struct kfd_process *p, u32 num_events,
-			void __user *data, bool all, u32 *user_timeout_ms,
-			u32 *wait_result);
 
 #endif /* KFD_KNOD_H_ */

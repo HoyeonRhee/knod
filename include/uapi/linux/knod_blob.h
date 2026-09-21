@@ -16,8 +16,6 @@
 #ifndef _UAPI_LINUX_KNOD_BLOB_H
 #define _UAPI_LINUX_KNOD_BLOB_H
 
-#include <linux/types.h>
-
 #define KNOD_BLOB_MAGIC		0x4b4e4442	/* 'KNDB' */
 #define KNOD_BLOB_ABI_VERSION	16
 
@@ -37,6 +35,8 @@
 #define KNOD_BLOB_LINK_CALL	1
 
 #ifndef __ASSEMBLY__
+
+#include <linux/types.h>
 
 /*
  * Which routine an entry holds.  Array maps index straight into storage, so
@@ -273,31 +273,26 @@ struct knod_blob_map_desc {
 /*
  * What the prologue walks to reach a lane's packet, in the order it does it.
  *
- * The dispatch packet gives it the parameter block; the parameter block gives
- * it this workgroup's ring descriptor and this lane's context; the ring
- * descriptor gives it a buffer descriptor; the buffer descriptor gives it the
- * page and the offset within it.  None of that is the routine's to choose, so
- * unlike the map descriptor these are the kernel's own structures, published
- * so a prologue built outside the kernel can read them.
+ * The persistent-shader mailbox gives it the parameter block; the parameter block
+ * gives it this workgroup's ring descriptor and this lane's context; the ring
+ * descriptor gives it a buffer descriptor; the buffer descriptor gives it
+ * the page and the offset within it. None of that is the routine's to choose,
+ * so unlike the map descriptor these are the kernel's own structures,
+ * published so a prologue built outside the kernel can read them.
  *
  * Anything here changing is an ABI break, same as the register binding.
  */
-#define KNOD_BLOB_AQL_KERNARG		40	/* hsa_kernel_dispatch_packet */
-
 #define KNOD_BLOB_PARAM_NR_BACKLOGS	0
 #define KNOD_BLOB_PARAM_NR_QUEUES	4
 #define KNOD_BLOB_PARAM_SPSC_STRIDE	8
 /* Actual sizes, in the two pairs a scalar load reaches them in. */
-#define KNOD_BLOB_PARAM_BATCH_SIZE	16
+#define KNOD_BLOB_PARAM_PACKETS_PER_RXQ	16
 #define KNOD_BLOB_PARAM_WG_SIZE	20
 #define KNOD_BLOB_PARAM_PAGE_SHIFT	24
 #define KNOD_BLOB_PARAM_SPSC_SHIFT	28
 #define KNOD_BLOB_PARAM_KTIME_NS	32
-#define KNOD_BLOB_PARAM_PASS_COUNT	40
-#define KNOD_BLOB_PARAM_PASS_META	168
-#define KNOD_BLOB_PARAM_QUEUES		424
-#define KNOD_BLOB_PARAM_PASS_INDICES	1448
-#define KNOD_BLOB_PARAM_SUB		132520
+#define KNOD_BLOB_PARAM_QUEUES		40
+#define KNOD_BLOB_PARAM_SUB		1064
 
 /* knod_bpf_queue_desc, one per ring.  count through ring_mask land in one
  * four-dword load, which is why the padding is there.
