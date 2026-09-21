@@ -489,6 +489,10 @@ struct knod_bpf_stats {
 	 */
 	u64 start_ns;
 	u64 batch_timeouts;
+	u64 completion_irq_arms;
+	u64 completion_irq_events;
+	u64 completion_irq_wait_timeouts;
+	u64 completion_irq_errors;
 	u64 first_publish_ns;
 	u64 last_publish_ns;
 	u64 stop_ns;		/* 0 while still running */
@@ -547,6 +551,9 @@ struct knod_bpf_priv {
 	unsigned int batch_head;
 	unsigned int batches_inflight;
 	bool batch_fault;
+	bool completion_irq_armed;
+	bool completion_irq_ready;
+	u32 completion_irq_fence;
 	struct knod_mem *persistent_mem;
 	bool persistent_shader_running;
 	u32 persistent_shader_slot;

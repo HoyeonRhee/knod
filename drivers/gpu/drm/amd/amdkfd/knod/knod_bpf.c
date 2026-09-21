@@ -465,6 +465,11 @@ unsigned int knod_bpf_wgp;
 MODULE_PARM_DESC(wgp, "WGP placement (persistent-shader BPF requires CU mode=0)");
 module_param_named(wgp, knod_bpf_wgp, uint, 0444);
 
+static bool knod_bpf_completion_irq;
+MODULE_PARM_DESC(completion_irq,
+		 "Notify the BPF worker of mailbox completion with an SDMA trap IRQ");
+module_param_named(completion_irq, knod_bpf_completion_irq, bool, 0444);
+
 #define KNOD_EA(extack, msg)   NL_SET_ERR_MSG_MOD((extack), msg)
 
 DEFINE_STATIC_KEY_FALSE(knod_stats_key);
@@ -1548,6 +1553,16 @@ static void knod_bpf_drain_worker(struct knod_bpf_priv *priv)
 				   KNOD_BPF_MAILBOX_DEPTH;
 		priv->batches_inflight--;
 	}
+	/* The notification command reads done[] from persistent_mem.  A stopped
+	 * worker may leave one armed, so prove that read has passed its fence
+	 * before the resident lifetime or its backing can be torn down.
+	 */
+	while (priv->completion_irq_armed &&
+	       knod_sdma_wait(priv->knod, 0, priv->completion_irq_fence,
+			      USEC_PER_SEC))
+		pr_warn_ratelimited("knod: waiting for SDMA completion notification during stop\n");
+	priv->completion_irq_armed = false;
+	priv->completion_irq_ready = false;
 	knod_bpf_persistent_shader_stop(priv, KNOD_BPF_STOP_SHUTDOWN);
 	WRITE_ONCE(priv->batch_fault, false);
 }
@@ -2970,6 +2985,56 @@ static bool knod_bpf_poll_complete(struct knod_bpf_priv *priv,
 	return false;
 }
 
+static int knod_bpf_arm_completion_irq(struct knod_bpf_priv *priv)
+{
+	struct knod_bpf_batch *batch;
+	u64 done_addr;
+	int err;
+
+	if (!priv->batches_inflight || priv->completion_irq_armed ||
+	    priv->completion_irq_ready)
+		return 0;
+
+	batch = &priv->batches[priv->batch_head];
+	done_addr = priv->persistent_mem->gaddr +
+		offsetof(struct knod_persistent_mem, control) +
+		KNOD_PERSIST_SLOT_BASE + batch->slot * KNOD_PERSIST_SLOT_BYTES +
+		KNOD_PERSIST_DONE;
+	err = knod_sdma_notify_u64(priv->knod, 0, done_addr, sizeof(u64),
+				   batch->sequence, priv->nr_works,
+				   &priv->completion_irq_fence);
+	if (err) {
+		if (err != -ENOSPC)
+			priv->stats.completion_irq_errors++;
+		return err;
+	}
+
+	priv->completion_irq_armed = true;
+	priv->stats.completion_irq_arms++;
+	return 0;
+}
+
+static void knod_bpf_wait_completion_irq(struct knod_bpf_priv *priv)
+{
+	bool signaled = false;
+	int err;
+
+	err = knod_sdma_wait_event(priv->knod, 0, 1, &signaled);
+	if (err) {
+		if (err != -EINTR && err != -ERESTARTSYS)
+			priv->stats.completion_irq_errors++;
+		return;
+	}
+	if (!signaled) {
+		priv->stats.completion_irq_wait_timeouts++;
+		return;
+	}
+
+	priv->completion_irq_armed = false;
+	priv->completion_irq_ready = true;
+	priv->stats.completion_irq_events++;
+}
+
 static void knod_bpf_schedule_pending_napi(struct knod_bpf_priv *priv)
 {
 	struct knod_dev *knodev = priv->knodev;
@@ -3049,6 +3114,9 @@ static int knod_bpf_worker(void *arg)
 		rcu_read_lock_bh();
 		/* Mailbox sequences are retired FIFO from the fixed batch ring. */
 		while (priv->batches_inflight) {
+			if (knod_bpf_completion_irq &&
+			    !priv->completion_irq_ready)
+				break;
 			batch = &priv->batches[priv->batch_head];
 			if (!knod_bpf_poll_complete(priv, batch))
 				break;
@@ -3058,6 +3126,8 @@ static int knod_bpf_worker(void *arg)
 			priv->batches_inflight--;
 			progressed = true;
 		}
+		if (knod_bpf_completion_irq && priv->completion_irq_ready)
+			priv->completion_irq_ready = false;
 		if (!priv->batches_inflight)
 			WRITE_ONCE(priv->batch_fault, false);
 
@@ -3086,7 +3156,11 @@ static int knod_bpf_worker(void *arg)
 					       KNOD_BPF_STOP_SEQUENCE_WRAP);
 		}
 
-		if (!priv->batches_inflight) {
+		if (knod_bpf_completion_irq && priv->batches_inflight) {
+			knod_bpf_arm_completion_irq(priv);
+			if (priv->completion_irq_armed)
+				knod_bpf_wait_completion_irq(priv);
+		} else if (!priv->batches_inflight) {
 			knod_bpf_schedule_pending_napi(priv);
 			usleep_range(100, 200);
 		} else if (!progressed) {
@@ -3105,6 +3179,8 @@ static int knod_bpf_batch_ring_init(struct knod_bpf_priv *priv)
 	priv->worker_task = NULL;
 	priv->batches_inflight = 0;
 	priv->batch_head = 0;
+	priv->completion_irq_armed = false;
+	priv->completion_irq_ready = false;
 
 	for (i = 0; i < KNOD_BPF_MAILBOX_DEPTH; i++) {
 		batch = &priv->batches[i];
@@ -9685,7 +9761,8 @@ static int knod_stats_show(struct seq_file *s, void *unused)
 		   gfx / 10000, (gfx / 100) % 100, gfx % 100);
 	seq_printf(s, "jit_engine:          %s\n",
 		   "blob");
-	seq_puts(s, "completion_mode:     mailbox_poll\n");
+	seq_printf(s, "completion_mode:     %s\n",
+		   knod_bpf_completion_irq ? "irq" : "poll");
 	seq_printf(s, "queue_expire_ms:     %u\n", knod_bpf_expire);
 	seq_printf(s, "wgp:                 %s\n", knod_bpf_wgp ? "yes" : "no");
 	seq_printf(s, "cycle_probe:         %u%s\n", knod_bpf_cycle_probe,
@@ -9710,6 +9787,14 @@ static int knod_stats_show(struct seq_file *s, void *unused)
 	seq_printf(s, "backlogs_avg:        %llu\n",
 		   dcnt ? stats->backlogs_total / dcnt : 0);
 	seq_printf(s, "batch_timeouts:      %llu\n", stats->batch_timeouts);
+	seq_printf(s, "completion_irq_arms: %llu\n",
+		   stats->completion_irq_arms);
+	seq_printf(s, "completion_irq_events: %llu\n",
+		   stats->completion_irq_events);
+	seq_printf(s, "completion_irq_wait_timeouts: %llu\n",
+		   stats->completion_irq_wait_timeouts);
+	seq_printf(s, "completion_irq_errors: %llu\n",
+		   stats->completion_irq_errors);
 	seq_printf(s, "persistent_shader_launches: %llu\n",
 		   priv->persistent_shader_launches);
 	seq_printf(s, "persistent_shader_stops: %llu\n",
@@ -9946,7 +10031,6 @@ static int knod_debugfs_init(struct knod_bpf_priv *priv)
 			    &knod_stats_enable_fops);
 	debugfs_create_file("stats_reset", 0200, bpf_dir, priv,
 			    &knod_stats_reset_fops);
-
 	return 0;
 }
 

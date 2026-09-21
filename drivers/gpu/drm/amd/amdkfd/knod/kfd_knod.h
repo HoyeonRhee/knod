@@ -338,6 +338,10 @@ void knod_sdma_fence(struct knod *knod, u64 fence_addr, u32 fence_val,
 		     int idx);
 void knod_sdma_trap(struct knod *knod, int idx);
 void knod_sdma_doorbell(struct knod *knod, int idx);
+int knod_sdma_notify_u64(struct knod *knod, int idx, u64 addr,
+			 u32 stride, u64 value, int n, u32 *fence);
+int knod_sdma_wait_event(struct knod *knod, int idx, u32 timeout_ms,
+			 bool *signaled);
 
 /* One linear GPU->host SDMA copy (GPU VM addresses). */
 struct knod_sdma_copy_desc {

@@ -364,6 +364,84 @@ void knod_sdma_doorbell(struct knod *knod, int idx)
 	writeq(*wptr, sdma->doorbell);
 }
 
+static void knod_sdma_poll_u32(struct knod *knod, int idx, u64 addr,
+			       u32 value)
+{
+	struct knod_sdma *sdma = &knod->sdma[idx];
+	u32 ring_mask = (sdma->sdma->size / 4) - 1;
+	u64 *wptr = (u64 *)sdma->queue->kaddr + 1;
+	u32 *ptr = sdma->sdma->kaddr;
+
+	ptr[sdma->idx++ & ring_mask] = SDMA_PKT_HEADER_OP(SDMA_OP_POLL_REGMEM) |
+		SDMA_PKT_POLL_REGMEM_HEADER_FUNC(3) |
+		SDMA_PKT_POLL_REGMEM_HEADER_MEM_POLL(1);
+	ptr[sdma->idx++ & ring_mask] = lower_32_bits(addr) & 0xfffffffc;
+	ptr[sdma->idx++ & ring_mask] = upper_32_bits(addr);
+	ptr[sdma->idx++ & ring_mask] = value;
+	ptr[sdma->idx++ & ring_mask] = U32_MAX;
+	ptr[sdma->idx++ & ring_mask] =
+		SDMA_PKT_POLL_REGMEM_DW5_RETRY_COUNT(0xfff) |
+		SDMA_PKT_POLL_REGMEM_DW5_INTERVAL(4);
+
+	*wptr += 6 * 4;
+}
+
+int knod_sdma_notify_u64(struct knod *knod, int idx, u64 addr,
+			 u32 stride, u64 value, int n, u32 *fence)
+{
+	struct knod_sdma *sdma = &knod->sdma[idx];
+	u32 capacity = sdma->sdma->size / 4;
+	u32 completed, inflight, needed;
+	u64 fence_addr;
+	int i;
+
+	if (n <= 0 || !fence)
+		return -EINVAL;
+
+	completed = (u32)READ_ONCE(((struct amd_signal *)
+				    sdma->queue_signal->kaddr)->value);
+	inflight = (u32)sdma->idx - completed;
+	/* Two six-dword polls per value, then a fence and event trap. */
+	needed = n * 12 + 4 + 6;
+	if ((s32)(inflight + needed) >= (s32)(capacity - 64))
+		return -ENOSPC;
+
+	for (i = 0; i < n; i++, addr += stride) {
+		/* Match both halves before raising the CPU event. */
+		knod_sdma_poll_u32(knod, idx, addr + sizeof(u32),
+				   upper_32_bits(value));
+		knod_sdma_poll_u32(knod, idx, addr, lower_32_bits(value));
+	}
+
+	*fence = (u32)sdma->idx;
+	fence_addr = sdma->queue_signal->gaddr +
+		offsetof(struct amd_signal, value);
+	knod_sdma_fence(knod, fence_addr, *fence, idx);
+	knod_sdma_trap(knod, idx);
+	knod_sdma_doorbell(knod, idx);
+	return 0;
+}
+EXPORT_SYMBOL(knod_sdma_notify_u64);
+
+int knod_sdma_wait_event(struct knod *knod, int idx, u32 timeout_ms,
+			 bool *signaled)
+{
+	struct kfd_event_data event = {
+		.event_id = knod->sdma_event[idx].id,
+	};
+	u32 result;
+	int err;
+
+	if (!signaled)
+		return -EINVAL;
+
+	err = kfd_wait_on_events_kernel(knod->process, 1, &event, true,
+					&timeout_ms, &result);
+	*signaled = !err && result == KFD_IOC_WAIT_RESULT_COMPLETE;
+	return err;
+}
+EXPORT_SYMBOL(knod_sdma_wait_event);
+
 u32 knod_sdma_submit(struct knod *knod, int idx,
 		     const struct knod_sdma_copy_desc *copies, int n)
 {
