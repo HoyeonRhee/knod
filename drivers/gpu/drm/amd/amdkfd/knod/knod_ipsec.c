@@ -275,7 +275,6 @@ static void knod_ipsec_nod_exit(struct knod_dev *knodev);
 static bool knod_ipsec_post_copy(struct knod_dev *knodev, struct sk_buff *skb,
 				 const struct knod_pass_desc *desc,
 				 int queue_idx);
-static int knod_ipsec_init_shader_gfx9(struct knod *knod);
 static int knod_ipsec_init_shader_gfx10(struct knod *knod);
 static int knod_ipsec_init_shader_gfx11(struct knod *knod);
 static int knod_ipsec_work_pool_alloc(struct knod_ipsec_priv *priv);
@@ -863,9 +862,6 @@ static int knod_ipsec_nod_init(struct knod_dev *knodev)
 	 */
 	priv->isa_version = priv->knod->isa_version;
 	switch (priv->isa_version) {
-	case 9:
-		priv->shader_size = knod_ipsec_init_shader_gfx9(priv->knod);
-		break;
 	case 10:
 		priv->shader_size = knod_ipsec_init_shader_gfx10(priv->knod);
 		break;
@@ -1199,59 +1195,6 @@ static int knod_ipsec_load_shader(struct knod *knod, u32 kind, u32 variant,
 
 	knod_blob_free(&blob);
 	return err;
-}
-
-static int knod_ipsec_init_shader_gfx9(struct knod *knod)
-{
-	struct compute_pgm_rsrc1 rsrc1 = {};
-	struct compute_pgm_rsrc2 rsrc2 = {};
-	struct kernel_descriptor *kd = knod->kernels[0]->kaddr;
-	struct code_properties props = {};
-	int shader_size;
-	u32 off;
-
-	memset(kd, 0, sizeof(*kd));
-	kd->kernel_code_entry_byte_offset = 1024;
-	kd->group_segment_fixed_size = KNOD_GCM_T_TABLES_TOTAL;
-
-	/* VGPRs: (gran+1)*4. Need v0-v42 (43 VGPRs) -> gran=12 -> 52.
-	 * SGPRs: (gran+1)*8. Need s0-s59 (SR_RK2) -> gran=7 -> 64.
-	 */
-	rsrc1.granulated_workitem_vgpr_count = 12;
-	rsrc1.granulated_wavefront_sgpr_count = 7;
-	rsrc1.float_denorm_mode_32 = 3;
-	rsrc1.float_denorm_mode_16_64 = 3;
-	rsrc1.enable_dx10_clamp = 1;
-	rsrc1.enable_ieee_mode = 1;
-
-	rsrc2.user_sgpr_count = 15;
-	rsrc2.enable_sgpr_workgroup_id_x = 1;
-	rsrc2.enable_sgpr_workgroup_id_y = 1;
-	rsrc2.enable_sgpr_workgroup_id_z = 1;
-	rsrc2.granulated_lds_size = 8;
-
-	props.enable_sgpr_private_segment_buffer = 1;
-	props.enable_sgpr_dispatch_ptr = 1;
-	props.enable_sgpr_queue_ptr = 1;
-	props.enable_sgpr_kernarg_segment_ptr = 1;
-	props.enable_sgpr_dispatch_id = 1;
-	props.enable_sgpr_flat_scratch_init = 1;
-	props.enable_sgpr_private_segment_size = 1;
-
-	memcpy(&kd->compute_pgm_rsrc1, &rsrc1, sizeof(rsrc1));
-	memcpy(&kd->compute_pgm_rsrc2, &rsrc2, sizeof(rsrc2));
-	memcpy(&kd->code_properties, &props, sizeof(props));
-
-	off = kd->kernel_code_entry_byte_offset;
-	memset(knod->kernels[0]->kaddr + off, 0, (PAGE_SIZE << 4) - off);
-	shader_size = knod_ipsec_load_shader(knod, KNOD_BLOB_IPSEC_FUSED, 0,
-					     knod->kernels[0]->kaddr + off,
-					     (PAGE_SIZE << 4) - off);
-	if (shader_size < 0)
-		return shader_size;
-	pr_debug("knod_ipsec: GFX9 RX shader %d bytes\n", shader_size);
-
-	return shader_size;
 }
 
 static int knod_ipsec_init_shader_gfx10(struct knod *knod)
@@ -2291,8 +2234,8 @@ static bool knod_ipsec_dispatcher_try_rx(struct knod_ipsec_dispatcher *disp,
 
 	/* Build fused_param directly into kernarg. Zero the entire struct
 	 * so stale sub[batch_n..BATCH-1] entries from previous dispatches
-	 * cannot be picked up by a GPU kernarg prefetch - the GFX9 CP may
-	 * speculatively read beyond grid_size_y into the kernarg buffer,
+	 * cannot be picked up by a speculative GPU kernarg prefetch beyond
+	 * grid_size_y,
 	 * and a stale sub[].pkt_addr pointing at valid VRAM could cause
 	 * the shader to process garbage packets (observed as ICV failures
 	 * when the memset was removed).

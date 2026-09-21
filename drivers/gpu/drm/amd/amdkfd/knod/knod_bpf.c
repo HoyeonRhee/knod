@@ -332,13 +332,11 @@ static_assert(sizeof(struct knod_bpf_subparam_obj) ==
  * done_mask tracks lanes that have reached BPF_EXIT.
  * exec_save pairs store EXEC at branch points for restore at merge points.
  *
- * One layout for every generation, at the same indices, so that a dump reads
- * the same whichever GPU produced it and a prebuilt routine needs no shim to
- * name a register.  That means taking what the narrowest generation allows:
- * GFX9 addresses s[0:101] where GFX10 and GFX11 reach s[0:105], and GFX9
- * hardware corrupts s[32:33].  The pairs the others could have had go unused.
+ * One layout for every supported generation, at the same indices, so that a
+ * dump reads the same whichever GPU produced it and a prebuilt routine needs
+ * no shim to name a register.
  */
-/* Common SGPR special register indices (same on GFX9 and GFX10) */
+/* Common SGPR special register indices. */
 #define AMDGCN_SREG_VCC_LO		106
 #define AMDGCN_SREG_EXEC_LO		126
 #define AMDGCN_SREG_INTEGER_0		128
@@ -379,14 +377,6 @@ enum knod_probe_stage {
 	KNOD_PROBE_EPI_END,
 };
 
-static u8 knod_bpf_gfx9_sgpr_granule(unsigned int sgprs_used)
-{
-	if (sgprs_used <= 16)
-		return 0;
-
-	return 2 * (DIV_ROUND_UP(sgprs_used, 16) - 1);
-}
-
 unsigned int knod_bpf_workgroups = KNOD_BPF_WORKGROUPS_DEFAULT;
 MODULE_PARM_DESC(workgroups, "Workgroup size, multiple of 64, Min(64) Default/Max(256)");
 module_param_named(workgroups, knod_bpf_workgroups, int, 0600);
@@ -401,8 +391,7 @@ module_param_named(queue_expire, knod_bpf_expire, int, 0600);
  * histograms them - so the answer is per wave rather than an average of the
  * whole dispatch.
  *
- * Only the kernel emitter grows the probe, so it wants jit_engine=0, and only
- * where there is a counter to read: GFX9 has none.
+ * Only the kernel emitter grows the probe, so it wants jit_engine=0.
  */
 unsigned int knod_bpf_cycle_probe;
 MODULE_PARM_DESC(cycle_probe, "Time the shader in three parts, 0=Off(Default)");
@@ -684,111 +673,7 @@ static void debug_kernel_descriptor(struct kernel_descriptor *kernel_code)
 		kernel_code->code_properties.reserved1);
 }
 
-static void kfd_kernel_gfx9_init(struct knod *knod)
-{
-	struct kernel_descriptor *kernel_code = knod->kernels[0]->kaddr;
-
-	kernel_code->group_segment_fixed_size = 0;
-	kernel_code->private_segment_fixed_size = 0;
-	kernel_code->kernarg_size = 64;
-	kernel_code->kernel_code_entry_byte_offset = 1024;
-
-	/* GFX10+ or GFX90A+ */
-	kernel_code->compute_pgm_rsrc3.accum_offset = 0;
-	kernel_code->compute_pgm_rsrc3.reserved0 = 0;
-	kernel_code->compute_pgm_rsrc3.tg_split = 0;
-	kernel_code->compute_pgm_rsrc3.reserved1 = 0;
-
-	kernel_code->compute_pgm_rsrc1.granulated_workitem_vgpr_count =
-		(256 / 4) - 1;
-	kernel_code->compute_pgm_rsrc1.granulated_wavefront_sgpr_count =
-		knod_bpf_gfx9_sgpr_granule(KNOD_AMDGPU_SGPRS_USED);
-	kernel_code->compute_pgm_rsrc1.priority = 0;
-	kernel_code->compute_pgm_rsrc1.float_round_mode_32 = 0;
-	kernel_code->compute_pgm_rsrc1.float_round_mode_16_64 = 0;
-	kernel_code->compute_pgm_rsrc1.float_denorm_mode_32 = 3;
-	kernel_code->compute_pgm_rsrc1.float_denorm_mode_16_64 = 3;
-	kernel_code->compute_pgm_rsrc1.priv = 0;
-	kernel_code->compute_pgm_rsrc1.enable_dx10_clamp = 1;
-	kernel_code->compute_pgm_rsrc1.debug_mode = 0;
-	kernel_code->compute_pgm_rsrc1.enable_ieee_mode = 1;
-	kernel_code->compute_pgm_rsrc1.bulky = 0;
-	kernel_code->compute_pgm_rsrc1.cdbg_user = 0;
-	kernel_code->compute_pgm_rsrc1.fp16_ovfl = 0;
-	kernel_code->compute_pgm_rsrc1.reserved0 = 0;
-	kernel_code->compute_pgm_rsrc1.wgp_mode = 0;
-	kernel_code->compute_pgm_rsrc1.mem_ordered = 0;
-	kernel_code->compute_pgm_rsrc1.fwd_progress = 0;
-
-	kernel_code->compute_pgm_rsrc2.enable_private_segment = 0;
-	kernel_code->compute_pgm_rsrc2.user_sgpr_count = 12; /* 4+2+2+2+2 */
-	kernel_code->compute_pgm_rsrc2.enable_trap_handler = 0;
-	kernel_code->compute_pgm_rsrc2.enable_sgpr_workgroup_id_x = 1;
-	kernel_code->compute_pgm_rsrc2.enable_sgpr_workgroup_id_y = 1;
-	kernel_code->compute_pgm_rsrc2.enable_sgpr_workgroup_id_z = 0;
-	kernel_code->compute_pgm_rsrc2.enable_sgpr_workgroup_info = 0;
-	kernel_code->compute_pgm_rsrc2.enable_vgpr_workitem_id = 0;
-	kernel_code->compute_pgm_rsrc2.enable_exception_address_watch = 0;
-	kernel_code->compute_pgm_rsrc2.enable_exception_memory = 0;
-	kernel_code->compute_pgm_rsrc2.granulated_lds_size = 0;
-	kernel_code->compute_pgm_rsrc2
-		.enable_exception_ieee_754_fp_invalid_operation = 0;
-	kernel_code->compute_pgm_rsrc2.enable_exception_fp_denormal_source = 0;
-	kernel_code->compute_pgm_rsrc2
-		.enable_exception_ieee_754_fp_division_by_zero = 0;
-	kernel_code->compute_pgm_rsrc2
-		.enable_exception_ieee_754_fp_overflow = 0;
-	kernel_code->compute_pgm_rsrc2
-		.enable_exception_ieee_754_fp_underflow = 0;
-	kernel_code->compute_pgm_rsrc2.enable_exception_ieee_754_fp_inexact = 0;
-	kernel_code->compute_pgm_rsrc2.enable_exception_int_divide_by_zero = 0;
-	kernel_code->compute_pgm_rsrc2.reserved0 = 0;
-
-	/*
-	 * User SGPR layout - loaded in fixed order, disabled entries are
-	 * skipped (not reserved).  The resulting SGPR map depends on which
-	 * flags are enabled:
-	 *
-	 *   enable_sgpr_private_segment_buffer  -> 4 SGPRs  (s[0:3])
-	 *   enable_sgpr_dispatch_ptr            -> 2 SGPRs  (s[4:5])
-	 *   enable_sgpr_queue_ptr               -> 2 SGPRs
-	 *   enable_sgpr_kernarg_segment_ptr     -> 2 SGPRs
-	 *   enable_sgpr_dispatch_id             -> 2 SGPRs
-	 *   enable_sgpr_flat_scratch_init       -> disabled (LDS stack)
-	 *   enable_sgpr_private_segment_size    -> 1 SGPR
-	 *
-	 * System SGPRs (WorkgroupId etc.) follow immediately after the
-	 * last user SGPR.  user_sgpr_count must match the total above.
-	 */
-	/* 4 SGPRs */
-	kernel_code->code_properties.enable_sgpr_private_segment_buffer = 1;
-	/* 2 SGPRs */
-	kernel_code->code_properties.enable_sgpr_dispatch_ptr = 1;
-	/* 2 SGPRs */
-	kernel_code->code_properties.enable_sgpr_queue_ptr = 1;
-	/* 2 SGPRs */
-	kernel_code->code_properties.enable_sgpr_kernarg_segment_ptr = 1;
-	/* 2 SGPRs */
-	kernel_code->code_properties.enable_sgpr_dispatch_id = 1;
-	/* 2 SGPRs */
-	/* disabled -> the stack is in LDS, nothing touches scratch */
-	kernel_code->code_properties.enable_sgpr_flat_scratch_init = 0;
-	kernel_code->code_properties.enable_sgpr_private_segment_size = 0;
-	/* total = 12 SGPRs, workgroup_id_x lands at s12 */
-	kernel_code->code_properties.reserved0 = 0;
-	/* GFX10+ */
-	kernel_code->code_properties.enable_wavefront_size32 = 0;
-	kernel_code->code_properties.uses_dynamic_stack = 0;
-	kernel_code->code_properties.reserved1 = 0;
-
-	debug_kernel_descriptor(kernel_code);
-}
-
-/* gfx10 and gfx11 want the same descriptor.  Every field that is per
- * generation - the VGPR granule, the reserved SGPR count, wave size,
- * mem_ordered - has the same value on both, which is what the IPsec
- * shader found when it was measured on each.
- */
+/* GFX10 and GFX11 use the same Wave64 kernel descriptor contract. */
 static void kfd_kernel_rdna_init(struct knod *knod)
 {
 	struct kernel_descriptor *kernel_code = knod->kernels[0]->kaddr;
@@ -904,10 +789,7 @@ static int kfd_kernel_init(struct knod *knod, struct knod_bpf_priv *priv)
 	 */
 	priv->active_idx = 0;
 
-	if (priv->isa_version == 9)
-		kfd_kernel_gfx9_init(knod);
-	else
-		kfd_kernel_rdna_init(knod);
+	kfd_kernel_rdna_init(knod);
 
 	/*
 	 * Slot 1 must carry the same kernel-descriptor as slot 0 -- gfx init
@@ -3179,8 +3061,8 @@ static int knod_bpf_activate(struct knod_dev *knodev)
 	 * while the kernel descriptor went out unwritten, so the dispatch
 	 * would run whatever was in that VRAM.  Refuse rather than hang.
 	 */
-	if (priv->isa_version < 9 || priv->isa_version > 11) {
-		pr_warn("knod_bpf: XDP offload needs gfx9 to gfx11, this GPU is gfx%d\n",
+	if (priv->isa_version < 10 || priv->isa_version > 11) {
+		pr_warn("knod_bpf: XDP offload needs gfx10 or gfx11, this GPU is gfx%d\n",
 			priv->isa_version);
 		return -EOPNOTSUPP;
 	}
@@ -3510,24 +3392,12 @@ static int knod_bpf_check_percpu_store(struct knod_prog *knod_prog,
 		goto reject;
 	}
 
-	/* There is no atomic narrower than a dword, and a 64-bit one hangs
-	 * GFX9 against VRAM.
-	 */
+	/* There is no atomic narrower than a dword. */
 	if (BPF_SIZE(meta->insn.code) != BPF_W &&
 	    BPF_SIZE(meta->insn.code) != BPF_DW) {
 		why = "no atomic is narrower than a dword; widen the value to __u32";
 		goto reject;
 	}
-	if (BPF_SIZE(meta->insn.code) == BPF_DW &&
-	    knod_prog->knod->isa_version == 9) {
-		/* Saying "use an atomic" here would send them at a wall: the
-		 * explicit form is refused too, this part has no 64-bit atomic
-		 * at all.
-		 */
-		why = "this GPU has no 64-bit atomic, so no form of a 64-bit counter offloads; make it __u32";
-		goto reject;
-	}
-
 	meta->percpu_rmw_add = alu;
 	meta->percpu_rmw_uniform =
 		knod_bpf_percpu_addr_uniform(knod_prog, meta);
@@ -4267,10 +4137,6 @@ static void knod_map_bypass_l0(struct knod_bpf_priv *priv,
 				continue;
 			insn->gfx10.flat.glc = 1;
 			insn->gfx10.flat.dlc = 1;
-		} else if (priv->isa_version == 9) {
-			if (insn->gfx9.flat.op >= GFX9_GLOBAL_STORE_BYTE)
-				continue;
-			insn->gfx9.flat.glc = 1;
 		} else {
 			WARN_ON_ONCE(1);
 		}
@@ -5064,12 +4930,7 @@ static void knod_bpf_xdp_adjust_head(struct knod_bpf_priv *priv,
 	knod_vset32(&dend_hi, KNOD_AMDGPU_DATA_END_VREG_HI);
 
 	knod_iset32(&imm, ETH_HLEN);
-	/*
-	 * v_sub_co_u32 is VOP2 on GFX9, whose vsrc1 must be a VGPR (a literal
-	 * there reads v0). Subtraction is not commutative, so materialise
-	 * ETH_HLEN into a scratch VGPR (ub_hi, overwritten by the high half
-	 * below) and use it as src1 instead of an immediate.
-	 */
+	/* Materialise ETH_HLEN in the scratch VGPR used as src1. */
 	knod_mov32(priv, meta, ub_hi, imm);
 	knod_emit(priv, meta, v_sub_co_u32, ub_lo, dend_lo, ub_hi);
 	knod_iset32(&imm, 0);
@@ -7767,14 +7628,8 @@ static int knod_bpf_jit(struct knod_dev *knodev,
 			 * global_atomic_* with glc=1 returns old value in vdst.
 			 * For non-FETCH ops use glc=0 (fire-and-forget).
 			 *
-			 * 64-bit atomics (global_atomic_*_x2) hang on GFX9
-			 * VRAM. GFX10+ supports them.
+			 * RDNA supports both dword and qword atomics.
 			 */
-			if (is_dw && priv->isa_version == 9) {
-				pr_err("knod: 64-bit atomic not supported on GFX9\n");
-				return -EOPNOTSUPP;
-			}
-
 			/*
 			 * For CMPXCHG/FETCH: drain pending loads so addr/data
 			 * VGPRs are ready. For non-fetch ADD wave reduction,
@@ -9485,11 +9340,8 @@ no_cycles:
 			   stats->hwid_dispatches % 100 : 0);
 		for (i = 0; i < KNOD_HWID_SLOTS; i++)
 			if (stats->hwid_hist[i])
-				seq_printf(s, "  se%u %s%u %s%-2u   %llu\n",
-					   i >> 5,
-					   priv->isa_version == 9 ? "sh" : "sa",
-					   (i >> 4) & 1,
-					   priv->isa_version == 9 ? "cu" : "wgp",
+				seq_printf(s, "  se%u sa%u wgp%-2u   %llu\n",
+					   i >> 5, (i >> 4) & 1,
 					   i & 0xf, stats->hwid_hist[i]);
 	}
 

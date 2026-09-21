@@ -561,20 +561,12 @@ static int knod_set_isa(struct knod *knod)
 	enum amd_asic_type asic_type;
 
 	asic_type = adev->asic_type;
-	if (knod->isa_version != 9 && knod->isa_version != 10 &&
-	    knod->isa_version != 11)
+	if (knod->isa_version != 10 && knod->isa_version != 11)
 		knod->isa_version = 0;
 	if (knod->isa_version == 0) {
 		if (asic_type <= CHIP_VEGAM) {
 			pr_err("Not supported chip");
 			return -EOPNOTSUPP;
-		} else if (asic_type == CHIP_VEGA10 ||
-				asic_type == CHIP_VEGA12 ||
-				asic_type == CHIP_VEGA20 ||
-				asic_type == CHIP_RAVEN ||
-				asic_type == CHIP_RENOIR) {
-			pr_debug("GCN5 is detected");
-			knod->isa_version = 9;
 		} else if (asic_type == CHIP_NAVI10 ||
 				asic_type == CHIP_NAVI12 ||
 				asic_type == CHIP_NAVI14 ||

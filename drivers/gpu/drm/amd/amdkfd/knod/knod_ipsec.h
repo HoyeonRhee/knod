@@ -62,7 +62,7 @@ struct knod_ipsec_priv;
  * Per-dispatch packet batch. The RX fused shader launches grid_y=nr_packets
  * workgroups and each workgroup indexes its own sub[wg_y] entry, so batch
  * scales linearly with GPU occupancy up to the LDS-bound concurrent
- * workgroup limit (~1024 on 64-CU gfx9 with 4 KB LDS per WG). Bumping this
+ * workgroup limit. Bumping this
  * grows:
  *   - struct knod_ipsec_fused_param  (sub[] inline in kernarg)
  *   - work_decrypt_pool VRAM          (BATCH * DECRYPT_PKT_SIZE)
