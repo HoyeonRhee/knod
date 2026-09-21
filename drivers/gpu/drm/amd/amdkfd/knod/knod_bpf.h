@@ -55,7 +55,7 @@
 #define KNOD_BPF_INFLIGHT		3	/* triple-buffered dispatches */
 #define KNOD_BPF_WORKGROUPS_DEFAULT     256
 #define KNOD_BPF_WORKGROUPS_MIN         64
-#define KNOD_BPF_WORKGROUPS_MAX         256
+#define KNOD_BPF_WORKGROUPS_MAX         768
 #define KNOD_BPF_EXPIRE_DEFAULT		10
 #define KNOD_BPF_EXPIRE_MIN		1
 #define KNOD_BPF_EXPIRE_MAX		1000
@@ -220,13 +220,9 @@ struct knod_bpf_param {
 	u32 nr_queues;
 	u32 spsc_stride;
 	u32 _pad0;
-	/* Shift counts the prologue needs.  They follow the module parameters,
-	 * so a shader built once cannot carry them as immediates; it loads them
-	 * from here instead.  Kept in pairs the prologue can reach with the
-	 * two-dword scalar load it already has.
-	 */
-	u32 batch_shift;
-	u32 wg_shift;
+	/* Actual sizes permit a non-power-of-two WG768 geometry. */
+	u32 batch_size;
+	u32 workgroup_size;
 	u32 page_shift;
 	u32 spsc_shift;
 	u64 ktime_ns;		/* snapshot of ktime_get_ns() at dispatch */

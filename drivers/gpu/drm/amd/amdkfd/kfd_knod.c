@@ -1324,6 +1324,18 @@ static int knod_stats_show(struct seq_file *s, void *unused)
 }
 DEFINE_SHOW_ATTRIBUTE(knod_stats);
 
+/* Match the KFD queue accounting used for CWSR backing.  Keep this local to
+ * KNOD so the resident-BPF admission check can use the actual generation's
+ * VGPR file size without changing generic queue policy.
+ */
+static u32 knod_vgpr_size_per_cu(u32 gfxv)
+{
+	if (gfxv == 110000 || gfxv == 110001 || gfxv == 110501)
+		return 0x60000;
+
+	return 0x40000;
+}
+
 struct knod *knod_alloc_ctx(struct knod_dev *knodev, int queue_cnt, int id,
 			    int channels)
 {
@@ -1395,6 +1407,10 @@ struct knod *knod_alloc_ctx(struct knod_dev *knodev, int queue_cnt, int id,
 				 topo_dev->node_props.simd_per_cu;
 	if (!knod->cu_count)
 		knod->cu_count = 1;
+	knod->simd_per_cu = topo_dev->node_props.simd_per_cu;
+	knod->max_waves_per_simd = topo_dev->node_props.max_waves_per_simd;
+	knod->vgpr_size_per_cu =
+		knod_vgpr_size_per_cu(knod->gfx_target_version);
 	knod->lds_size = topo_dev->node_props.lds_size_in_kb * 1024;
 	if (!knod->lds_size)
 		knod->lds_size = 65536;

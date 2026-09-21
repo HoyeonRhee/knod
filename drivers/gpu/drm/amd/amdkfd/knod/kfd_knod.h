@@ -167,6 +167,9 @@ struct knod {
 	int queue_cnt;
 	int sdma_cnt;
 	int cu_count;
+	u32 simd_per_cu;
+	u32 max_waves_per_simd;
+	u32 vgpr_size_per_cu;
 	/* LDS a workgroup can have, in bytes, as the topology reports it. */
 	u32 lds_size;
 	int igpu;

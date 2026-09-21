@@ -19,7 +19,7 @@
 #include <linux/types.h>
 
 #define KNOD_BLOB_MAGIC		0x4b4e4442	/* 'KNDB' */
-#define KNOD_BLOB_ABI_VERSION	13
+#define KNOD_BLOB_ABI_VERSION	16
 
 /*
  * How a routine is reached.  SPLICE is what the JIT does: the bytes are copied
@@ -287,9 +287,9 @@ struct knod_blob_map_desc {
 #define KNOD_BLOB_PARAM_NR_BACKLOGS	0
 #define KNOD_BLOB_PARAM_NR_QUEUES	4
 #define KNOD_BLOB_PARAM_SPSC_STRIDE	8
-/* Shift counts, in the two pairs a scalar load reaches them in. */
-#define KNOD_BLOB_PARAM_BATCH_SHIFT	16
-#define KNOD_BLOB_PARAM_WG_SHIFT	20
+/* Actual sizes, in the two pairs a scalar load reaches them in. */
+#define KNOD_BLOB_PARAM_BATCH_SIZE	16
+#define KNOD_BLOB_PARAM_WG_SIZE	20
 #define KNOD_BLOB_PARAM_PAGE_SHIFT	24
 #define KNOD_BLOB_PARAM_SPSC_SHIFT	28
 #define KNOD_BLOB_PARAM_KTIME_NS	32
@@ -358,6 +358,8 @@ struct knod_blob_map_desc {
 /* What the prologue leaves behind. */
 #define KNOD_BLOB_PRO_SLOT_VREG		58	/* v[58:59] the lane's spsc_bd */
 #define KNOD_BLOB_PRO_CTX_VREG		60	/* v[60:61] the lane's xdp_md */
+/* Queue-local index, live through the prologue for LDS base setup. */
+#define KNOD_BLOB_PRO_LOCAL_IDX_VREG	40
 #define KNOD_BLOB_PRO_IDX_VREG		62	/* backlog index, flat */
 #define KNOD_BLOB_PRO_DATA_VREG		64	/* v[64:65] packet start */
 #define KNOD_BLOB_PRO_DATA_END_VREG	66	/* v[66:67] packet end */

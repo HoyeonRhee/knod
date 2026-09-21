@@ -32,10 +32,10 @@
  */
 static_assert(offsetof(struct hsa_kernel_dispatch_packet, kernarg_address) ==
 	      KNOD_BLOB_AQL_KERNARG);
-static_assert(offsetof(struct knod_bpf_param, batch_shift) ==
-	      KNOD_BLOB_PARAM_BATCH_SHIFT);
-static_assert(offsetof(struct knod_bpf_param, wg_shift) ==
-	      KNOD_BLOB_PARAM_WG_SHIFT);
+static_assert(offsetof(struct knod_bpf_param, batch_size) ==
+	      KNOD_BLOB_PARAM_BATCH_SIZE);
+static_assert(offsetof(struct knod_bpf_param, workgroup_size) ==
+	      KNOD_BLOB_PARAM_WG_SIZE);
 static_assert(offsetof(struct knod_bpf_param, page_shift) ==
 	      KNOD_BLOB_PARAM_PAGE_SHIFT);
 static_assert(offsetof(struct knod_bpf_param, spsc_shift) ==
@@ -197,6 +197,22 @@ static_assert(sizeof(struct knod_bpf_subparam_obj) ==
 #define KNOD_AMDGPU_STACK_WIN_VREG1	129
 /* The lane's byte offset into the LDS stack, lane * 4, computed once. */
 #define KNOD_AMDGPU_LDS_BASE_VREG	130
+
+/* Native RDNA emission has no packet cache above v69.  Remap the three LDS
+ * temporaries into the first free registers so the descriptor can truthfully
+ * reserve 80 VGPRs and still admit twelve Wave64 waves for WG768.
+ */
+#define KNOD_AMDGPU_RDNA_LDS_VREG0	70
+static_assert(KNOD_AMDGPU_RDNA_LDS_VREG0 >
+	      KNOD_AMDGPU_PAGE_BASE_VREG_HI);
+static_assert(KNOD_AMDGPU_RDNA_LDS_VREG0 + 2 < 80);
+
+static unsigned int knod_bpf_lds_vreg(const struct knod_bpf_priv *priv,
+				      unsigned int reg)
+{
+	return KNOD_AMDGPU_RDNA_LDS_VREG0 + reg -
+		KNOD_AMDGPU_STACK_WIN_VREG0;
+}
 
 /* One VGPR holds four bytes of packet, so what the cache can hold is decided
  * by how many VGPRs sit between its base and the stack.
@@ -378,8 +394,12 @@ enum knod_probe_stage {
 };
 
 unsigned int knod_bpf_workgroups = KNOD_BPF_WORKGROUPS_DEFAULT;
-MODULE_PARM_DESC(workgroups, "Workgroup size, multiple of 64, Min(64) Default/Max(256)");
-module_param_named(workgroups, knod_bpf_workgroups, int, 0600);
+MODULE_PARM_DESC(workgroups, "RDNA BPF workgroup size: 256, 512, or 768");
+module_param_named(workgroups, knod_bpf_workgroups, uint, 0444);
+
+static unsigned int knod_bpf_vgpr_reserve = 80;
+module_param_named(vgpr_reserve, knod_bpf_vgpr_reserve, uint, 0444);
+MODULE_PARM_DESC(vgpr_reserve, "Native VGPR allocation: 80, 128, or 256");
 
 unsigned int knod_bpf_expire = KNOD_BPF_EXPIRE_DEFAULT;
 MODULE_PARM_DESC(queue_expire, "Queue expire time(ms), Min(1), Default(10), Max(1000)");
@@ -435,12 +455,11 @@ static void knod_bpf_emit_lds_base_init(struct knod_bpf_priv *priv,
 {
 	struct amdgcn_param32 base, idx, k;
 
-	knod_vset32(&base, KNOD_AMDGPU_LDS_BASE_VREG);
-	knod_vset32(&idx, KNOD_AMDGPU_IDX_VREG);
-	knod_iset32(&k, knod_bpf_workgroups - 1);
-	knod_and32(priv, meta, base, k, idx);
+	knod_vset32(&base,
+		    knod_bpf_lds_vreg(priv, KNOD_AMDGPU_LDS_BASE_VREG));
+	knod_vset32(&idx, KNOD_BLOB_PRO_LOCAL_IDX_VREG);
 	knod_iset32(&k, 2);
-	knod_lshlrev32(priv, meta, base, k, base);
+	knod_lshlrev32(priv, meta, base, k, idx);
 }
 
 /* Whether a workgroup takes the whole WGP.  In CU mode its waves sit on one CU
@@ -454,7 +473,7 @@ static void knod_bpf_emit_lds_base_init(struct knod_bpf_priv *priv,
  */
 unsigned int knod_bpf_wgp;
 MODULE_PARM_DESC(wgp, "Spread a workgroup over the WGP 0=Off(Default), 1=On");
-module_param_named(wgp, knod_bpf_wgp, int, 0600);
+module_param_named(wgp, knod_bpf_wgp, uint, 0444);
 
 #define KNOD_EA(extack, msg)   NL_SET_ERR_MSG_MOD((extack), msg)
 
@@ -724,12 +743,11 @@ static void kfd_kernel_rdna_init(struct knod *knod)
 	kernel_code->compute_pgm_rsrc3.tg_split = 0;
 	kernel_code->compute_pgm_rsrc3.reserved1 = 0;
 
-	if (kernel_code->code_properties.enable_wavefront_size32 == 1)
-		kernel_code->compute_pgm_rsrc1.granulated_workitem_vgpr_count =
-			(256 / 8) - 1;
-	else
-		kernel_code->compute_pgm_rsrc1.granulated_workitem_vgpr_count =
-			(256 / 4) - 1;
+	/* Wave64 allocates VGPRs in groups of four.  Every native operand used
+	 * by the JIT and resident wrapper is below v80.
+	 */
+	kernel_code->compute_pgm_rsrc1.granulated_workitem_vgpr_count =
+		(knod_bpf_vgpr_reserve / 4) - 1;
 	kernel_code->compute_pgm_rsrc1.granulated_wavefront_sgpr_count = 0;
 	kernel_code->compute_pgm_rsrc1.priority = 0;
 	kernel_code->compute_pgm_rsrc1.float_round_mode_32 = 0;
@@ -888,8 +906,8 @@ static struct knod_bpf_work_sq *knod_prepare_bpf(struct knod_bpf_priv *priv)
 	 * pool with this, so it has to be what the pool was laid out with.
 	 */
 	param->spsc_stride = spsc_elem_size(&knodev->wpriv[0].spsc_bds);
-	param->batch_shift = ilog2(priv->batch_size);
-	param->wg_shift = ilog2(knod_bpf_workgroups);
+	param->batch_size = priv->batch_size;
+	param->workgroup_size = knod_bpf_workgroups;
 	param->page_shift = PAGE_SHIFT;
 	param->spsc_shift = ilog2(param->spsc_stride);
 	for (i = 0; i < priv->nr_works; i++) {
@@ -1510,8 +1528,7 @@ static int knod_bpf_start_worker(struct knod_bpf_priv *priv)
 
 /* One workgroup per queue, so a queue is one CU's worth of work and its
  * dispatch batch is one workgroup of packets - capped by the static descriptor
- * array and rounded down to a power of two, since the shader derives the flat
- * slot as queue_id << ilog2(batch_size) + local_idx.
+ * array. The shader derives the flat slot as queue_id * batch_size + local_idx.
  *
  * Fanning a queue out over several workgroups was tried and gave the CUs back
  * nothing; what the dispatch waited on was never the compute.  It also cannot
@@ -1527,7 +1544,7 @@ static unsigned int knod_bpf_batch_size(struct knod_bpf_priv *priv)
 
 	if (!batch)
 		batch = knod_bpf_workgroups;
-	return rounddown_pow_of_two(batch);
+	return batch;
 }
 
 static void knod_bpf_start(struct knod_dev *knodev)
@@ -2919,6 +2936,35 @@ static void knod_priv_exit(struct knod_bpf_priv *priv)
 		knod_free_mem(priv->knod, priv->pass_meta_buf);
 }
 
+static int knod_bpf_geometry_check(const struct knod *knod)
+{
+	u32 waves = DIV_ROUND_UP(knod_bpf_workgroups, 64);
+	u32 vgpr_waves, topology_waves;
+
+	if (knod_bpf_workgroups != 256 && knod_bpf_workgroups != 512 &&
+	    knod_bpf_workgroups != 768)
+		return -EINVAL;
+	if (knod_bpf_vgpr_reserve != 80 && knod_bpf_vgpr_reserve != 128 &&
+	    knod_bpf_vgpr_reserve != 256)
+		return -EINVAL;
+	if (!knod->simd_per_cu || !knod->max_waves_per_simd ||
+	    !knod->vgpr_size_per_cu)
+		return -EOPNOTSUPP;
+
+	topology_waves = knod->simd_per_cu * knod->max_waves_per_simd;
+	vgpr_waves = knod->vgpr_size_per_cu /
+		(knod_bpf_vgpr_reserve * 64 * sizeof(u32));
+	if (waves > min(topology_waves, vgpr_waves)) {
+		pr_warn("knod_bpf: WG%u needs %u resident waves, only %u fit (VGPR%u)\n",
+			knod_bpf_workgroups, waves,
+			min(topology_waves, vgpr_waves),
+			knod_bpf_vgpr_reserve);
+		return -E2BIG;
+	}
+
+	return 0;
+}
+
 static int knod_priv_init(struct knod_bpf_priv *priv)
 {
 	struct knod_dev *knodev = priv->knodev;
@@ -3014,15 +3060,19 @@ static struct knod_bpf_priv *__knod_accel_xdp_init(struct knod_accel *accel,
 	}
 
 	INIT_LIST_HEAD(&priv->list);
-	if (knod_bpf_workgroups < KNOD_BPF_WORKGROUPS_MIN ||
-	    knod_bpf_workgroups > KNOD_BPF_WORKGROUPS_MAX)
-		knod_bpf_workgroups = KNOD_BPF_WORKGROUPS_DEFAULT;
-	/* Round to a power of two so the prologue can reach a lane's slot with
-	 * a shift.  A multiply would need the count itself, which is a module
-	 * parameter and so cannot be an immediate in a prebuilt shader.
-	 */
-	else if (!is_power_of_2(knod_bpf_workgroups))
-		knod_bpf_workgroups = 1U << ilog2(knod_bpf_workgroups);
+	if (knod->isa_version == 10 || knod->isa_version == 11) {
+		err = knod_bpf_geometry_check(knod);
+		if (err) {
+			pr_warn("knod_bpf: unsupported RDNA BPF workgroup geometry\n");
+			goto err_blob;
+		}
+	} else if (knod_bpf_workgroups < KNOD_BPF_WORKGROUPS_MIN ||
+		   knod_bpf_workgroups > 256 ||
+		   !is_power_of_2(knod_bpf_workgroups)) {
+		pr_warn("knod_bpf: gfx9 BPF workgroup size must be 64, 128, or 256\n");
+		err = -EINVAL;
+		goto err_blob;
+	}
 
 	if (knod_bpf_expire < KNOD_BPF_EXPIRE_MIN ||
 	    knod_bpf_expire > KNOD_BPF_EXPIRE_MAX)
@@ -3049,6 +3099,11 @@ static struct knod_bpf_priv *__knod_accel_xdp_init(struct knod_accel *accel,
 	 */
 
 	return priv;
+
+err_blob:
+	knod_blob_free(&priv->blob);
+	kfree(priv);
+	return ERR_PTR(err);
 }
 
 /* Feature select: allocate the BPF GPU compute resources. */
@@ -5260,13 +5315,17 @@ static struct amdgcn_param32 *knod_bpf_stack_win(struct knod_bpf_priv *priv,
 						 struct amdgcn_param32 *win,
 						 int off, bool load)
 {
-	knod_vset32(&win[0], KNOD_AMDGPU_STACK_WIN_VREG0);
-	knod_vset32(&win[1], KNOD_AMDGPU_STACK_WIN_VREG1);
+	knod_vset32(&win[0],
+		    knod_bpf_lds_vreg(priv, KNOD_AMDGPU_STACK_WIN_VREG0));
+	knod_vset32(&win[1],
+		    knod_bpf_lds_vreg(priv, KNOD_AMDGPU_STACK_WIN_VREG1));
 
 	if (load) {
 		struct amdgcn_param32 base;
 
-		knod_vset32(&base, KNOD_AMDGPU_LDS_BASE_VREG);
+		knod_vset32(&base,
+			    knod_bpf_lds_vreg(priv,
+					       KNOD_AMDGPU_LDS_BASE_VREG));
 		knod_emit(priv, meta, ds_read_b32, win[0], base,
 			  knod_bpf_lds_off(priv, meta, off & ~3));
 		knod_emit(priv, meta, ds_read_b32, win[1], base,
@@ -5283,7 +5342,8 @@ static void knod_bpf_stack_win_flush(struct knod_bpf_priv *priv,
 {
 	struct amdgcn_param32 base;
 
-	knod_vset32(&base, KNOD_AMDGPU_LDS_BASE_VREG);
+	knod_vset32(&base,
+		    knod_bpf_lds_vreg(priv, KNOD_AMDGPU_LDS_BASE_VREG));
 	knod_emit(priv, meta, ds_write_b32, base, win[0],
 		  knod_bpf_lds_off(priv, meta, off & ~3));
 	knod_emit(priv, meta, ds_write_b32, base, win[1],
