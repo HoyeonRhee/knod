@@ -209,8 +209,8 @@ struct knod_bpf_queue_desc {
 	u64 pool_gaddr;		/* SPSC pool GTT address for this queue */
 	u64 base_gaddr;		/* dma-buf base address for this queue */
 	u32 count;		/* number of packets from this queue */
-	/* was start_idx; kept for global_load_dwordx4 layout */
-	u32 _pad;
+	/* Kernel-emitted bounds helpers read this; blob ignores this dword. */
+	u32 rx_bounds;
 	u32 ring_start;		/* acquired cursor at peek time */
 	u32 ring_mask;		/* capacity - 1 */
 };

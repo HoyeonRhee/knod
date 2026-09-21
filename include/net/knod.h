@@ -91,7 +91,20 @@ struct page_pool_hostmem {
 	struct gen_pool *genpool;	/* private: managed by the provider */
 };
 
+/* Immutable XDP frame bounds published by the RX provider.  Zero is invalid
+ * so a provider cannot silently fall back to page-wide packet bounds.
+ */
+static inline u32 knod_rx_bounds_encode(u32 headroom, u32 frame_size)
+{
+	if (headroom > U16_MAX || frame_size > U16_MAX ||
+	    frame_size <= headroom)
+		return 0;
+
+	return frame_size << 16 | headroom;
+}
+
 struct knod_work_priv {
+	u32 rx_bounds; /* low16: headroom, high16: frame size from hard start */
 	struct dma_buf *dmabuf;
 	netmem_ref *netmems;
 	unsigned int *data_lens;

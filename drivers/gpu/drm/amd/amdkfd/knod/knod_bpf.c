@@ -871,6 +871,8 @@ static struct knod_bpf_work_sq *knod_prepare_bpf(struct knod_bpf_priv *priv)
 		param->queues[i].pool_gaddr = knodev->wpriv[i].spsc_pool_gaddr;
 		param->queues[i].base_gaddr = priv->queue_base_gaddr[i];
 		param->queues[i].count = cnt;
+		param->queues[i].rx_bounds =
+			READ_ONCE(knodev->wpriv[i].rx_bounds);
 		param->queues[i].ring_start =
 			knodev->wpriv[i].spsc_bds.acquired + skip;
 		param->queues[i].ring_mask =
@@ -4858,21 +4860,103 @@ static int knod_bpf_get_map_id(struct knod_bpf_priv *priv,
 	return map->id;
 }
 
+/* Build one immutable CPU-XDP frame bound from the original SPSC descriptor.
+ * The descriptor offset is not changed by adjust_head(), unlike DATA_VREG.
+ * rx_bounds is uniform for the queue and occupies a blob-ignored descriptor
+ * dword, so the queue descriptor remains 32 bytes.
+ *
+ * Uses s16/s18:s19 and v30-v35. @invalid is one when the provider did not
+ * publish bounds or the descriptor offset precedes its advertised headroom.
+ */
+static void knod_bpf_packet_bound(struct knod_bpf_priv *priv,
+				  struct knod_insn_meta *meta,
+				  struct amdgcn_param64 dst,
+				  struct amdgcn_param32 invalid,
+				  bool end)
+{
+	struct amdgcn_param64 param, page;
+	struct amdgcn_param32 geometry, original_off, frame, headroom;
+	struct amdgcn_param32 extent, queue, soff, scalar_geometry, slot, imm;
+
+	knod_sset64(&param, KNOD_AMDGPU_PARAM_SREG_LO);
+	knod_vset64(&page, KNOD_AMDGPU_PAGE_BASE_VREG_LO);
+	knod_vset32(&geometry, 30);
+	knod_vset32(&original_off, 31);
+	knod_vset32(&frame, 32);
+	knod_vset32(&headroom, 33);
+	knod_vset32(&extent, 34);
+	knod_sset32(&queue, KNOD_BLOB_PRO_WG_Y_SREG);
+	knod_sset32(&soff, 16);
+	knod_sset32(&scalar_geometry, 18);
+	knod_vset32(&slot, KNOD_AMDGPU_SLOT_VREG_LO);
+
+	knod_iset32(&imm, 5);
+	knod_emit(priv, meta, s_lshl_b32, soff, queue, imm);
+	knod_emit(priv, meta, s_load_dwordx2_soff, scalar_geometry, param.lo,
+		  offsetof(struct knod_bpf_param, queues) +
+		  offsetof(struct knod_bpf_queue_desc, rx_bounds), 16);
+	knod_emit(priv, meta, s_waitcnt_lgkmcnt);
+	knod_mov32(priv, meta, geometry, scalar_geometry);
+
+	knod_emit(priv, meta, global_load_ushort, original_off, slot,
+		  offsetof(struct spsc_bd, off));
+	knod_wait_vmcnt(priv, meta);
+
+	knod_iset32(&imm, 0xffff);
+	knod_emit(priv, meta, v_and_b32_e32, headroom, imm, geometry);
+	knod_iset32(&imm, 16);
+	knod_emit(priv, meta, v_lshrrev_b32, frame, imm, geometry);
+
+	/* A zero encoding is the fail-closed sentinel. */
+	knod_iset32(&imm, 0);
+	knod_emit(priv, meta, v_cmp_eq_u32, imm, geometry);
+	knod_iset32(&imm, 1);
+	knod_mov32(priv, meta, extent, imm);
+	knod_iset32(&imm, 0);
+	knod_emit(priv, meta, v_cndmask_b32_e32, invalid, imm, extent);
+
+	/* A corrupt descriptor must not wrap the hard start below its page. */
+	knod_emit(priv, meta, v_cmp_lt_u32, original_off, headroom);
+	knod_iset32(&imm, 1);
+	knod_mov32(priv, meta, extent, imm);
+	knod_iset32(&imm, 0);
+	knod_emit(priv, meta, v_cndmask_b32_e32, extent, imm, extent);
+	knod_emit(priv, meta, v_or_b32_e32, invalid, invalid, extent);
+
+	knod_emit(priv, meta, v_sub_co_u32, original_off, original_off,
+		  headroom);
+	knod_emit(priv, meta, v_add_co_u32, dst.lo, original_off, page.lo);
+	knod_iset32(&imm, 0);
+	knod_emit(priv, meta, v_add_co_ci_u32_e32, dst.hi, imm, page.hi);
+
+	if (!end)
+		return;
+
+	knod_iset32(&imm, SKB_DATA_ALIGN(sizeof(struct skb_shared_info)));
+	/* v_sub_co_u32 is VOP2 on GFX9, so vsrc1 must be a VGPR. */
+	knod_mov32(priv, meta, extent, imm);
+	knod_emit(priv, meta, v_sub_co_u32, extent, frame, extent);
+	knod_emit(priv, meta, v_add_co_u32, dst.lo, extent, dst.lo);
+	knod_iset32(&imm, 0);
+	knod_emit(priv, meta, v_add_co_ci_u32_e32, dst.hi, imm, dst.hi);
+}
+
 /*
  * knod_bpf_xdp_adjust_head - JIT bpf_xdp_adjust_head (helper 44).
  *
  * R2 = delta (signed 32-bit).  Adjusts DATA_VREG by delta.
- * Bounds: page_base <= DATA_VREG <= DATA_END_VREG - ETH_HLEN.
+ * Bounds: frame_hard_start <= DATA_VREG <= DATA_END_VREG - ETH_HLEN.
  * Each bound is checked with its own VOPC, but VCC is captured into
  * VGPRs via v_cndmask (VALU) rather than SGPRs via s_mov_b64 (SALU).
  * VALU reads VCC correctly after VOPC; only SALU suffers the GFX10
  * dual-VOPC stale-read hazard.
- * page_base is reloaded on demand from param + spsc_bd.
+ * The provider-published frame geometry and original SPSC descriptor offset
+ * reconstruct frame_hard_start for every call, including cumulative calls.
  * On failure, DATA_VREG is restored and R0 = -EINVAL.
  * On success, R0 = 0.
  *
  * Clobbers: TMP_VREG0 (v22:v23), TMP_VREG1 (v24:v25), TMP_VREG2 (v26:v27),
- *           TMP_SREG0 (s16), TMP_SREG2 (s20:s21).
+ *           v30-v35, s16, s18:s19.
  */
 static void knod_bpf_xdp_adjust_head(struct knod_bpf_priv *priv,
 				    struct knod_insn_meta *meta)
@@ -4882,6 +4966,7 @@ static void knod_bpf_xdp_adjust_head(struct knod_bpf_priv *priv,
 	struct amdgcn_param32 tmp0_lo, tmp0_hi, data_lo, data_hi, fail_lo;
 	struct amdgcn_param32 fail_hi;
 	struct amdgcn_param64 data_vreg, pbase_vreg, ub;
+	struct amdgcn_param32 invalid;
 	struct amdgcn_param32 r0_lo, r0_hi, imm, delta;
 
 	knod_vset64(&data_vreg, KNOD_AMDGPU_DATA_VREG_LO);
@@ -4895,6 +4980,7 @@ static void knod_bpf_xdp_adjust_head(struct knod_bpf_priv *priv,
 	knod_vset32(&delta, bpf_reg64[2].lo.v);
 	knod_vset32(&fail_lo, KNOD_AMDGPU_TMP_VREG2_LO);
 	knod_vset32(&fail_hi, KNOD_AMDGPU_TMP_VREG2_HI);
+	knod_vset32(&invalid, 35);
 
 	/* 1. Save original DATA_VREG -> TMP_VREG0 */
 	knod_mov32(priv, meta, tmp0_lo, data_lo);
@@ -4910,8 +4996,9 @@ static void knod_bpf_xdp_adjust_head(struct knod_bpf_priv *priv,
 	knod_emit(priv, meta, v_add_co_ci_u32_e32, data_hi, sext_dst,
 		  data_hi);
 
-	/* 3. Lower bound: DATA_VREG < page_base -> VCC = fail */
-	knod_vset64(&pbase_vreg, KNOD_AMDGPU_PAGE_BASE_VREG_LO);
+	/* 3. Lower bound: DATA_VREG < immutable hard start -> fail. */
+	knod_vset64(&pbase_vreg, KNOD_AMDGPU_TMP_VREG1_LO);
+	knod_bpf_packet_bound(priv, meta, pbase_vreg, invalid, false);
 	knod_emit(priv, meta, v_cmp_lt_u64, data_vreg, pbase_vreg);
 
 	/*
@@ -4922,6 +5009,7 @@ static void knod_bpf_xdp_adjust_head(struct knod_bpf_priv *priv,
 	knod_mov32(priv, meta, fail_hi, imm);
 	knod_iset32(&imm, 0);
 	knod_emit(priv, meta, v_cndmask_b32_e32, fail_lo, imm, fail_hi);
+	knod_emit(priv, meta, v_or_b32_e32, fail_lo, fail_lo, invalid);
 
 	/* 5. Upper bound: DATA_VREG > DATA_END_VREG - ETH_HLEN */
 	knod_vset32(&ub_lo, KNOD_AMDGPU_TMP_VREG1_LO);
@@ -4972,17 +5060,18 @@ static void knod_bpf_xdp_adjust_head(struct knod_bpf_priv *priv,
  * knod_bpf_xdp_adjust_tail - JIT bpf_xdp_adjust_tail (helper 65).
  *
  * R2 = delta (signed 32-bit).  Adjusts DATA_END_VREG by delta.
- * Bounds: DATA_VREG + ETH_HLEN <= DATA_END_VREG <= page_base + PAGE_SIZE.
+ * Bounds: DATA_VREG + ETH_HLEN <= DATA_END_VREG <= frame_hard_end.
  * Each bound is checked with its own VOPC, but VCC is captured into
  * VGPRs via v_cndmask (VALU) rather than SGPRs via s_mov_b64 (SALU).
  * VALU reads VCC correctly after VOPC; only SALU suffers the GFX10
  * dual-VOPC stale-read hazard.
- * page_base is reloaded on demand from param + spsc_bd.
+ * The provider-published frame geometry and original SPSC descriptor offset
+ * reconstruct frame_hard_end for every call, including cumulative calls.
  * On failure, DATA_END_VREG is restored and R0 = -EINVAL.
  * On success, R0 = 0.
  *
  * Clobbers: TMP_VREG0 (v22:v23), TMP_VREG1 (v24:v25), TMP_VREG2 (v26:v27),
- *           TMP_SREG0 (s16), TMP_SREG2 (s20:s21).
+ *           v30-v35, s16, s18:s19.
  */
 static void knod_bpf_xdp_adjust_tail(struct knod_bpf_priv *priv,
 				    struct knod_insn_meta *meta)
@@ -4990,9 +5079,9 @@ static void knod_bpf_xdp_adjust_tail(struct knod_bpf_priv *priv,
 	struct amdgcn_param32 tmp0_lo, tmp0_hi, dend_lo, dend_hi, fail_lo;
 	struct amdgcn_param32 fail_hi;
 	struct amdgcn_param32 lb_lo, lb_hi, d_lo, d_hi, sext_dst, shift_amt;
-	struct amdgcn_param32 pb_src_lo, pb_src_hi;
 	struct amdgcn_param32 r0_lo, r0_hi;
 	struct amdgcn_param32 imm, delta;
+	struct amdgcn_param32 invalid;
 	struct amdgcn_param64 dend_vreg, lb;
 
 	knod_vset32(&tmp0_lo, KNOD_AMDGPU_TMP_VREG0_LO);
@@ -5005,6 +5094,7 @@ static void knod_bpf_xdp_adjust_tail(struct knod_bpf_priv *priv,
 	knod_vset32(&fail_lo, KNOD_AMDGPU_TMP_VREG2_LO);
 	knod_vset32(&fail_hi, KNOD_AMDGPU_TMP_VREG2_HI);
 	knod_vset64(&dend_vreg, KNOD_AMDGPU_DATA_END_VREG_LO);
+	knod_vset32(&invalid, 35);
 
 	/* 1. Save original DATA_END_VREG -> TMP_VREG0 */
 	knod_mov32(priv, meta, tmp0_lo, dend_lo);
@@ -5044,16 +5134,8 @@ static void knod_bpf_xdp_adjust_tail(struct knod_bpf_priv *priv,
 	knod_iset32(&imm, 0);
 	knod_emit(priv, meta, v_cndmask_b32_e32, fail_lo, imm, fail_hi);
 
-	/* 4. Upper bound: ub = page_base + PAGE_SIZE -> TMP_VREG1 */
-	knod_vset32(&pb_src_lo, KNOD_AMDGPU_PAGE_BASE_VREG_LO);
-	knod_vset32(&pb_src_hi, KNOD_AMDGPU_PAGE_BASE_VREG_HI);
-	knod_mov32(priv, meta, lb_lo, pb_src_lo);
-	knod_mov32(priv, meta, lb_hi, pb_src_hi);
-
-	knod_iset32(&imm, PAGE_SIZE);
-	knod_emit(priv, meta, v_add_co_u32, lb_lo, imm, lb_lo);
-	knod_iset32(&imm, 0);
-	knod_emit(priv, meta, v_add_co_ci_u32_e32, lb_hi, imm, lb_hi);
+	/* 4. Upper bound: immutable hard end from provider frame geometry. */
+	knod_bpf_packet_bound(priv, meta, lb, invalid, true);
 
 	/* VOPC#2: DATA_END > ub -> VCC = upper_fail */
 	knod_emit(priv, meta, v_cmp_gt_u64, dend_vreg, lb);
@@ -5061,6 +5143,7 @@ static void knod_bpf_xdp_adjust_tail(struct knod_bpf_priv *priv,
 	/* Capture upper_fail via v_cndmask, combine, convert to VCC */
 	knod_iset32(&imm, 0);
 	knod_emit(priv, meta, v_cndmask_b32_e32, fail_hi, imm, fail_hi);
+	knod_emit(priv, meta, v_or_b32_e32, fail_hi, fail_hi, invalid);
 
 	knod_emit(priv, meta, v_or_b32_e32, fail_lo, fail_lo, fail_hi);
 
