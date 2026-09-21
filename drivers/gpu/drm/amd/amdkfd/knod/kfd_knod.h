@@ -354,6 +354,10 @@ struct knod_sdma_copy_desc {
 u32 knod_sdma_submit(struct knod *knod, int idx,
 		     const struct knod_sdma_copy_desc *copies, int n);
 void knod_sdma_kick(struct knod *knod, int idx);
+u32 knod_sdma_gl2_maintain(struct knod *knod, int idx,
+			   struct knod_mem *const *mems, int n,
+			   bool writeback);
+int knod_sdma_wait(struct knod *knod, int idx, u32 fence, u32 timeout_us);
 
 int knod_gart_map(struct amdgpu_device *adev, u64 npages,
 		  dma_addr_t *addr, u64 *gart_addr, u64 flags);

@@ -253,10 +253,15 @@ struct knod_bpf_batch {
 enum knod_bpf_stop_reason {
 	KNOD_BPF_STOP_SHUTDOWN,
 	KNOD_BPF_STOP_PROGRAM,
-	KNOD_BPF_STOP_MAP,
-	KNOD_BPF_STOP_GC,
 	KNOD_BPF_STOP_SEQUENCE_WRAP,
 	KNOD_BPF_STOP_REASON_MAX,
+};
+
+enum knod_bpf_pause_reason {
+	KNOD_BPF_PAUSE_PROGRAM,
+	KNOD_BPF_PAUSE_HOST_MAP,
+	KNOD_BPF_PAUSE_MAP_GC,
+	KNOD_BPF_PAUSE_REASON_MAX,
 };
 
 struct knod_bpf_reg_state {
@@ -410,6 +415,7 @@ struct knod_prog {
 	 * hardware allocates in.  Zero in every other mode.
 	 */
 	u32 lds_bytes;
+	bool uses_map_delete;
 
 	struct knod_insn_meta *meta;
 	enum bpf_prog_type type;
@@ -550,12 +556,23 @@ struct knod_bpf_priv {
 	u64 map_gc_checks;
 	u64 map_gc_elements;
 	u64 map_gc_maps;
-	enum knod_bpf_stop_reason pending_stop_reason;
+	u64 batch_pause_requests;
+	u64 batch_pause_acks;
+	u64 batch_pause_cut_sequence;
+	u64 batch_pause_reasons[KNOD_BPF_PAUSE_REASON_MAX];
+	u64 host_map_generation;
+	u64 map_visibility_before;
+	u64 map_visibility_after;
+	u64 map_visibility_before_ns;
+	u64 map_visibility_after_ns;
+	u64 map_visibility_failures;
+	bool map_visibility_fault;
 	struct task_struct *worker_task;
 	struct mutex map_op_lock;
-	bool map_op_quiesce;
+	bool batch_pause_requested;
 	bool maps_gc_pending;
-	u64 map_op_request, map_op_ack;
+	bool gpu_map_gc_possible;
+	u64 batch_pause_request, batch_pause_ack;
 	wait_queue_head_t map_op_wq;
 	/* maps awaiting deferred free by the worker */
 	struct list_head dead_maps;
@@ -569,7 +586,7 @@ struct knod_bpf_priv {
 	u32 kernel_image_len;
 	/* What the persistent shader wants in LDS. */
 	u32 lds_bytes;
-	/* batch size per queue */
+	/* Maximum packet count contributed by one RX queue to a batch. */
 	int packets_per_rxq;
 	int nr_works;
 	int isa_version;

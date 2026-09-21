@@ -513,9 +513,10 @@ static int knod_bpf_worker(void *arg);
 static void knod_bpf_drain_worker(struct knod_bpf_priv *priv);
 static void knod_prog_free(struct knod_prog *knod_prog);
 static int knod_setup_bpf_prog(struct bpf_prog *prog);
-static void knod_bpf_map_op_begin(struct knod_bpf_priv *priv,
-				  enum knod_bpf_stop_reason reason);
-static void knod_bpf_map_op_end(struct knod_bpf_priv *priv);
+static int knod_bpf_pause_and_drain_batches(struct knod_bpf_priv *priv,
+				 enum knod_bpf_pause_reason reason);
+static void knod_bpf_resume_batches(struct knod_bpf_priv *priv,
+				    bool advance_generation);
 
 static void knod_bpf_gpu_mem_fence(struct knod_bpf_priv *priv)
 {
@@ -1243,7 +1244,10 @@ static int knod_bpf_install_kernel(struct knod_bpf_priv *priv,
 		return -E2BIG;
 	image_len = entry_off + size;
 
-	knod_bpf_map_op_begin(priv, KNOD_BPF_STOP_PROGRAM);
+	err = knod_bpf_pause_and_drain_batches(priv, KNOD_BPF_PAUSE_PROGRAM);
+	if (err)
+		return err;
+	knod_bpf_persistent_shader_stop(priv, KNOD_BPF_STOP_PROGRAM);
 	memcpy(slot->kaddr + entry_off, code, size);
 	if (image_len < slot->size) {
 		u32 clear_end = min_t(u32, slot->size,
@@ -1263,8 +1267,9 @@ static int knod_bpf_install_kernel(struct knod_bpf_priv *priv,
 	wmb();
 	knod_bpf_gpu_mem_fence(priv);
 	priv->lds_bytes = knod_prog->lds_bytes;
+	WRITE_ONCE(priv->gpu_map_gc_possible, knod_prog->uses_map_delete);
 	WRITE_ONCE(priv->kernel_image_len, image_len);
-	knod_bpf_map_op_end(priv);
+	knod_bpf_resume_batches(priv, false);
 	return err;
 }
 
@@ -1531,7 +1536,8 @@ static void knod_bpf_drain_worker(struct knod_bpf_priv *priv)
 
 	/* stop() runs on interface-down AND on every feature switch, both
 	 * with mlx5 RX possibly still producing into knodev->wpriv[].spsc_bds.
-	 * So we only quiesce the GPU here; the NIC-owned RX SPSC rings are
+	 * So we only drain and stop the persistent shader here; the NIC-owned
+	 * RX SPSC rings are
 	 * drained on interface-down by mlx5e_rx_offload_stop().
 	 */
 	while (priv->batches_inflight) {
@@ -1553,11 +1559,14 @@ static void knod_bpf_drain(struct knod_bpf_priv *priv)
 
 static void knod_bpf_stop_worker(struct knod_bpf_priv *priv)
 {
+	struct task_struct *task;
+
 	priv->start = 0;
-	if (priv->worker_task) {
-		kthread_stop(priv->worker_task);
-		put_task_struct(priv->worker_task);
-		priv->worker_task = NULL;
+	task = xchg(&priv->worker_task, NULL);
+	if (task) {
+		wake_up_all(&priv->map_op_wq);
+		kthread_stop(task);
+		put_task_struct(task);
 	}
 	synchronize_net();
 }
@@ -1580,7 +1589,7 @@ static int knod_bpf_start_worker(struct knod_bpf_priv *priv)
 		return PTR_ERR(p);
 
 	get_task_struct(p);
-	priv->worker_task = p;
+	WRITE_ONCE(priv->worker_task, p);
 	return 0;
 }
 
@@ -1665,7 +1674,7 @@ static void knod_bpf_stop(struct knod_dev *knodev)
 	knod_bpf_drain(priv);
 }
 
-/* Restore PASS through the same quiesce/terminal/upload path as any program. */
+/* Restore PASS through the same pause/drain/terminal/upload path as any program. */
 static int knod_bpf_reload_pass(struct knod_dev *knodev)
 {
 	struct knod_bpf_priv *priv = knodev->accel->xdp.priv;
@@ -2487,35 +2496,140 @@ static int __knod_bpf_map_lookup_elem(struct bpf_offloaded_map *offmap,
 	return 0;
 }
 
-static void knod_bpf_map_op_begin(struct knod_bpf_priv *priv,
-				  enum knod_bpf_stop_reason reason)
+static int knod_bpf_map_visibility(struct knod_bpf_map *knod_map,
+				   bool writeback)
+{
+	struct knod_bpf_priv *priv = knod_map->priv;
+	struct knod_mem *mems[] = {
+		knod_map->mem,
+		knod_map->queue_mem,
+		knod_map->hash_elems_mem,
+		knod_map->gc_mem,
+	};
+	u64 begin = ktime_get_ns();
+	u32 fence;
+	int err;
+
+	/* Before the first persistent-shader launch, no GPU can have cached or
+	 * dirtied this map.  Kondor populates and may tear down thousands of map
+	 * elements in that state; issuing a GL2 request for every element is both
+	 * unnecessary and can overwhelm the interrupt handler on some SDMA 5.x
+	 * parts.  Once a launch has occurred, retain maintenance even while the
+	 * shader is stopped because GL2 may still contain data from that lifetime.
+	 */
+	if (!READ_ONCE(priv->persistent_shader_launches))
+		return 0;
+
+	fence = knod_sdma_gl2_maintain(priv->knod, 0, mems,
+					 ARRAY_SIZE(mems), writeback);
+	if (!fence) {
+		err = -EBUSY;
+		goto fail;
+	}
+	err = knod_sdma_wait(priv->knod, 0, fence, USEC_PER_SEC);
+	if (err)
+		goto fail;
+
+	if (writeback) {
+		priv->map_visibility_before++;
+		priv->map_visibility_before_ns += ktime_get_ns() - begin;
+	} else {
+		priv->map_visibility_after++;
+		priv->map_visibility_after_ns += ktime_get_ns() - begin;
+	}
+	return 0;
+
+fail:
+	priv->map_visibility_failures++;
+	priv->map_visibility_fault = true;
+	pr_err_ratelimited("knod_bpf: map GL2 %s failed: %d; submissions remain paused\n",
+			   writeback ? "writeback/invalidate" : "invalidate", err);
+	return err;
+}
+
+static int knod_bpf_pause_and_drain_batches(struct knod_bpf_priv *priv,
+				 enum knod_bpf_pause_reason reason)
 {
 	u64 request;
 
-	/* A cached map is written between dispatches, not under one. */
+	/* Host map state changes at a completed batch boundary. */
 	mutex_lock(&priv->map_op_lock);
 
-	if (!priv->worker_task)
-		return;
+	if (READ_ONCE(priv->batch_pause_requested) &&
+	    smp_load_acquire(&priv->batch_pause_ack) ==
+	    READ_ONCE(priv->batch_pause_request))
+		return 0;
 
-	request = priv->map_op_request + 1;
-	priv->pending_stop_reason = reason;
-	WRITE_ONCE(priv->map_op_quiesce, true);
+	request = priv->batch_pause_request + 1;
+	priv->batch_pause_requests++;
+	priv->batch_pause_reasons[reason]++;
+	WRITE_ONCE(priv->batch_pause_requested, true);
 	/* Publish this generation after preventing new submissions. */
-	smp_store_release(&priv->map_op_request, request);
-	/* Pairs with the worker's terminal-completion publication. */
+	smp_store_release(&priv->batch_pause_request, request);
+	if (!READ_ONCE(priv->worker_task)) {
+		priv->batch_pause_cut_sequence = priv->persistent_shader_sequence;
+		smp_store_release(&priv->batch_pause_ack, request);
+		priv->batch_pause_acks++;
+		return 0;
+	}
+
 	wait_event(priv->map_op_wq,
-		   /* Pairs with smp_store_release(&priv->map_op_ack). */
-		   smp_load_acquire(&priv->map_op_ack) == request);
+		   smp_load_acquire(&priv->batch_pause_ack) == request ||
+		   !READ_ONCE(priv->worker_task));
+	if (smp_load_acquire(&priv->batch_pause_ack) != request) {
+		mutex_unlock(&priv->map_op_lock);
+		return -ESHUTDOWN;
+	}
+	return 0;
 }
 
-static void knod_bpf_map_op_end(struct knod_bpf_priv *priv)
+static void knod_bpf_resume_batches(struct knod_bpf_priv *priv,
+				    bool advance_generation)
 {
 	knod_bpf_gpu_mem_fence(priv);
+	priv->map_visibility_fault = false;
+	if (advance_generation)
+		priv->host_map_generation++;
 	/* Host writes precede reopening submission for the next generation. */
-	smp_store_release(&priv->map_op_quiesce, false);
+	smp_store_release(&priv->batch_pause_requested, false);
 	wake_up(&priv->map_op_wq);
 	mutex_unlock(&priv->map_op_lock);
+}
+
+static void knod_bpf_leave_batches_paused(struct knod_bpf_priv *priv)
+{
+	mutex_unlock(&priv->map_op_lock);
+}
+
+static int knod_bpf_map_mutation_begin(struct knod_bpf_map *knod_map)
+{
+	int err;
+
+	err = knod_bpf_pause_and_drain_batches(knod_map->priv,
+					       KNOD_BPF_PAUSE_HOST_MAP);
+	if (err)
+		return err;
+	err = knod_bpf_map_visibility(knod_map, true);
+	if (err)
+		knod_bpf_leave_batches_paused(knod_map->priv);
+	return err;
+}
+
+static int knod_bpf_map_mutation_end(struct knod_bpf_map *knod_map,
+				     bool mutated)
+{
+	struct knod_bpf_priv *priv = knod_map->priv;
+	int err;
+
+	/* Make CPU writes reach the BO before stale GL2 lines are discarded. */
+	knod_bpf_gpu_mem_fence(priv);
+	err = knod_bpf_map_visibility(knod_map, false);
+	if (err) {
+		knod_bpf_leave_batches_paused(priv);
+		return err;
+	}
+	knod_bpf_resume_batches(priv, mutated);
+	return 0;
 }
 
 static int __knod_bpf_map_update_elem(struct bpf_offloaded_map *offmap,
@@ -2528,7 +2642,7 @@ static int __knod_bpf_map_update_elem(struct bpf_offloaded_map *offmap,
 	struct knod_dev *knodev;
 	void *bucket;
 	u32 stride;
-	int i;
+	int i, ret;
 
 	if (!knod_map || !knod_map->mem || !knod_map->mem->kaddr)
 		return -ENODEV;
@@ -2538,15 +2652,20 @@ static int __knod_bpf_map_update_elem(struct bpf_offloaded_map *offmap,
 	if (knod_map_obj->map_type == BPF_MAP_TYPE_ARRAY) {
 		if (idx >= knod_map_obj->max_entries)
 			return -ENOENT;
+		ret = knod_bpf_map_mutation_begin(knod_map);
+		if (ret)
+			return ret;
 
 		bucket = knod_bpf_array_value_ptr(knod_map_obj, idx);
 		unsafe_memcpy(bucket, value, knod_map_obj->value_size,
 			      "knod array values live in a variable-sized GPU map tail");
-		knod_bpf_gpu_mem_fence(priv);
-		return 0;
+		return knod_bpf_map_mutation_end(knod_map, true);
 	} else if (knod_map_obj->map_type == BPF_MAP_TYPE_PERCPU_ARRAY) {
 		if (idx >= knod_map_obj->max_entries)
 			return -ENOENT;
+		ret = knod_bpf_map_mutation_begin(knod_map);
+		if (ret)
+			return ret;
 		stride = round_up(knod_map_obj->value_size, 8);
 		bucket = &knod_map_obj->bucket[0];
 		bucket += (idx * knod_map_obj->value_size);
@@ -2557,22 +2676,24 @@ static int __knod_bpf_map_update_elem(struct bpf_offloaded_map *offmap,
 				      value + i * stride,
 				      knod_map_obj->value_size,
 				      "knod percpu array values live in a variable-sized GPU map tail");
-		knod_bpf_gpu_mem_fence(priv);
-		return 0;
+		return knod_bpf_map_mutation_end(knod_map, true);
 	} else if (knod_map_obj->map_type == BPF_MAP_TYPE_HASH ||
 		   knod_map_obj->map_type == BPF_MAP_TYPE_PERCPU_HASH) {
-		int ret = -ENOENT;
+		ret = -ENOENT;
 
 		mutex_lock(&knodev->lock);
 		list_for_each_entry(knod_map, &knodev->accel->xdp.bound_maps,
 				    list) {
 			if (knod_map->knod_map_obj == knod_map_obj) {
 				mutex_unlock(&knodev->lock);
-				knod_bpf_map_op_begin(priv, KNOD_BPF_STOP_MAP);
+				ret = knod_bpf_map_mutation_begin(knod_map);
+				if (ret)
+					return ret;
 				ret = knod_bpf_map_hash_update_elem(knod_map,
 						knod_map_obj,
 								    key, value);
-				knod_bpf_map_op_end(priv);
+				if (knod_bpf_map_mutation_end(knod_map, !ret))
+					return -EIO;
 				return ret;
 			}
 		}
@@ -2587,23 +2708,23 @@ static int __knod_bpf_map_delete_elem(struct bpf_offloaded_map *offmap,
 {
 	struct knod_bpf_map *knod_map = (struct knod_bpf_map *)offmap->dev_priv;
 	struct knod_bpf_map_obj *knod_map_obj;
-	struct knod_bpf_priv *priv;
 	int ret;
 
 	if (!knod_map || !knod_map->mem || !knod_map->mem->kaddr)
 		return -ENODEV;
 	knod_map_obj = knod_map->knod_map_obj;
-	priv = knod_map->priv;
-
 	if (knod_map_obj->map_type == BPF_MAP_TYPE_ARRAY ||
 	    knod_map_obj->map_type == BPF_MAP_TYPE_PERCPU_ARRAY)
 		return 0;
 	else if (knod_map_obj->map_type == BPF_MAP_TYPE_HASH ||
 		 knod_map_obj->map_type == BPF_MAP_TYPE_PERCPU_HASH) {
-		knod_bpf_map_op_begin(priv, KNOD_BPF_STOP_MAP);
+		ret = knod_bpf_map_mutation_begin(knod_map);
+		if (ret)
+			return ret;
 		ret = knod_bpf_map_hash_delete_elem(knod_map, knod_map_obj,
 						    key);
-		knod_bpf_map_op_end(priv);
+		if (knod_bpf_map_mutation_end(knod_map, !ret))
+			return -EIO;
 		return ret;
 	}
 
@@ -2677,7 +2798,7 @@ static unsigned int knod_bpf_map_gc_process(struct knod_bpf_map *knod_map)
  */
 #define KNOD_BPF_MAPS_TICK_INTERVAL 65536
 
-static bool knod_bpf_maps_need_gc(struct knod_bpf_priv *priv)
+static bool knod_bpf_maps_may_need_maintenance(struct knod_bpf_priv *priv)
 {
 	struct knod_dev *knodev = priv->knodev;
 	struct knod_bpf_map *knod_map;
@@ -2689,11 +2810,12 @@ static bool knod_bpf_maps_need_gc(struct knod_bpf_priv *priv)
 		pending = true;
 		goto out;
 	}
+	if (!READ_ONCE(priv->gpu_map_gc_possible))
+		goto out;
 
 	list_for_each_entry(knod_map, &knodev->accel->xdp.bound_maps, list) {
-		if ((knod_map->knod_map_obj->map_type == BPF_MAP_TYPE_HASH ||
-		     knod_map->knod_map_obj->map_type == BPF_MAP_TYPE_PERCPU_HASH) &&
-		    READ_ONCE(knod_map->knod_map_obj->meta.hmeta.gc_count)) {
+		if (knod_map->knod_map_obj->map_type == BPF_MAP_TYPE_HASH ||
+		    knod_map->knod_map_obj->map_type == BPF_MAP_TYPE_PERCPU_HASH) {
 			pending = true;
 			break;
 		}
@@ -2701,6 +2823,32 @@ static bool knod_bpf_maps_need_gc(struct knod_bpf_priv *priv)
 out:
 	mutex_unlock(&knodev->lock);
 	return pending;
+}
+
+static int knod_bpf_maps_visibility(struct knod_bpf_priv *priv,
+				    bool writeback)
+{
+	struct knod_dev *knodev = priv->knodev;
+	struct knod_bpf_map *knod_map;
+	int err = 0;
+
+	/* map_free only moves BOs to dead_maps. The worker is their sole freer,
+	 * so both lists remain stable while it owns map_op_lock here.
+	 */
+	mutex_lock(&knodev->lock);
+	list_for_each_entry(knod_map, &knodev->accel->xdp.bound_maps, list) {
+		err = knod_bpf_map_visibility(knod_map, writeback);
+		if (err)
+			goto out;
+	}
+	list_for_each_entry(knod_map, &priv->dead_maps, list) {
+		err = knod_bpf_map_visibility(knod_map, writeback);
+		if (err)
+			goto out;
+	}
+out:
+	mutex_unlock(&knodev->lock);
+	return err;
 }
 
 static void knod_bpf_maps_tick(struct knod_bpf_priv *priv)
@@ -2839,7 +2987,7 @@ static int knod_bpf_worker(void *arg)
 	struct knod_bpf_priv *priv = arg;
 	struct knod_bpf_batch *batch;
 	bool progressed;
-	bool quiesce;
+	bool pause;
 	u64 map_request;
 
 	while (!kthread_should_stop()) {
@@ -2851,31 +2999,48 @@ static int knod_bpf_worker(void *arg)
 
 		/* Advance the maintenance cadence even while the pipe stays full. */
 		if (!(++priv->maps_tick_skip & (KNOD_BPF_MAPS_TICK_INTERVAL - 1)) &&
-		    knod_bpf_maps_need_gc(priv))
+		    knod_bpf_maps_may_need_maintenance(priv))
 			WRITE_ONCE(priv->maps_gc_pending, true);
 
 		/* Reclaim map elements only after all GPU users have completed,
 		 * and exclude host map mutations while processing their free lists.
 		 */
 		if (READ_ONCE(priv->maps_gc_pending) && !priv->batches_inflight &&
-		    !READ_ONCE(priv->map_op_quiesce) &&
+		    !READ_ONCE(priv->batch_pause_requested) &&
 		    mutex_trylock(&priv->map_op_lock)) {
-			knod_bpf_persistent_shader_stop(priv, KNOD_BPF_STOP_GC);
-			knod_bpf_maps_tick(priv);
-			knod_bpf_gpu_mem_fence(priv);
+			u64 old_elements = priv->map_gc_elements;
+			u64 old_maps = priv->map_gc_maps;
+
+			priv->batch_pause_requests++;
+			priv->batch_pause_reasons[KNOD_BPF_PAUSE_MAP_GC]++;
+			priv->batch_pause_cut_sequence =
+				priv->persistent_shader_sequence;
+			if (!knod_bpf_maps_visibility(priv, true)) {
+				knod_bpf_maps_tick(priv);
+				knod_bpf_gpu_mem_fence(priv);
+				if (!knod_bpf_maps_visibility(priv, false)) {
+					if (old_elements != priv->map_gc_elements ||
+					    old_maps != priv->map_gc_maps)
+						priv->host_map_generation++;
+					priv->map_visibility_fault = false;
+					priv->batch_pause_acks++;
+				} else {
+					WRITE_ONCE(priv->maps_gc_pending, true);
+				}
+			}
 			mutex_unlock(&priv->map_op_lock);
 		}
 
 		progressed = false;
-		/* Acquire the host's quiesce request and its generation. */
-		quiesce = smp_load_acquire(&priv->map_op_quiesce);
-		if (quiesce) {
+		/* Acquire the host's pause request and its generation. */
+		pause = smp_load_acquire(&priv->batch_pause_requested);
+		if (pause) {
 			/* Pairs with the request's smp_store_release(). */
-			map_request = smp_load_acquire(&priv->map_op_request);
+			map_request = smp_load_acquire(&priv->batch_pause_request);
 		} else {
 			map_request = 0;
 		}
-		if (!quiesce && !priv->persistent_shader_running &&
+		if (!pause && !priv->persistent_shader_running &&
 		    !READ_ONCE(priv->maps_gc_pending)) {
 			knod_bpf_persistent_shader_control_init(priv);
 			knod_bpf_persistent_shader_start(priv);
@@ -2899,20 +3064,21 @@ static int knod_bpf_worker(void *arg)
 		/* Keep the pipe full up to KNOD_BPF_MAILBOX_DEPTH.
 		 * Staging self-limits, so this stops once the ring is drained.
 		 */
-		if (unlikely(quiesce)) {
-			/* Acknowledge outside RCU after any persistent shader stops. */
+		if (unlikely(pause)) {
+			/* Acknowledge after the submitted batch cut drains. */
 		} else if (!READ_ONCE(priv->maps_gc_pending)) {
 			while (knod_bpf_submit_work(priv))
 				progressed = true;
 		}
 		rcu_read_unlock_bh();
 
-		/* The terminal wait may sleep. No RCU read lock may cross it. */
-		if (quiesce && !priv->batches_inflight) {
-			knod_bpf_persistent_shader_stop(priv,
-					       priv->pending_stop_reason);
-			/* Publish terminal completion for this exact request. */
-			smp_store_release(&priv->map_op_ack, map_request);
+		if (pause && !priv->batches_inflight &&
+		    smp_load_acquire(&priv->batch_pause_ack) != map_request) {
+			priv->batch_pause_cut_sequence =
+				priv->persistent_shader_sequence;
+			priv->batch_pause_acks++;
+			/* Publish the drained batch cut for this exact request. */
+			smp_store_release(&priv->batch_pause_ack, map_request);
 			wake_up(&priv->map_op_wq);
 		} else if (!priv->batches_inflight &&
 			   priv->persistent_shader_running && priv->persistent_shader_sequence == U64_MAX) {
@@ -3074,8 +3240,8 @@ static int knod_priv_init(struct knod_bpf_priv *priv)
 	INIT_LIST_HEAD(&priv->dead_maps);
 	priv->maps_tick_skip = 0;
 	priv->maps_gc_pending = false;
-	priv->map_op_request = 0;
-	priv->map_op_ack = 0;
+	priv->batch_pause_request = 0;
+	priv->batch_pause_ack = 0;
 
 	priv->nr_works = knod_bpf_active_rxq_count(knodev->netdev);
 	if (!priv->nr_works) {
@@ -8790,6 +8956,7 @@ static int knod_bpf_jit(struct knod_dev *knodev,
 				if (!knod_bpf_map_op(priv, meta, map_id,
 						     KNOD_BLOB_OP_DELETE))
 					return -EOPNOTSUPP;
+				knod_prog->uses_map_delete = true;
 				map_id = -1;
 				break;
 			case 5:
@@ -9551,16 +9718,41 @@ static int knod_stats_show(struct seq_file *s, void *unused)
 		   priv->persistent_shader_stop_reasons[KNOD_BPF_STOP_SHUTDOWN]);
 	seq_printf(s, "stop_program:        %llu\n",
 		   priv->persistent_shader_stop_reasons[KNOD_BPF_STOP_PROGRAM]);
-	seq_printf(s, "stop_map:            %llu\n",
-		   priv->persistent_shader_stop_reasons[KNOD_BPF_STOP_MAP]);
-	seq_printf(s, "stop_gc:             %llu\n",
-		   priv->persistent_shader_stop_reasons[KNOD_BPF_STOP_GC]);
 	seq_printf(s, "stop_sequence_wrap:  %llu\n",
 		   priv->persistent_shader_stop_reasons[KNOD_BPF_STOP_SEQUENCE_WRAP]);
 	seq_printf(s, "batches_inflight:     %u\n", priv->batches_inflight);
 	seq_printf(s, "map_gc_checks:       %llu\n", priv->map_gc_checks);
 	seq_printf(s, "map_gc_elements:     %llu\n", priv->map_gc_elements);
 	seq_printf(s, "map_gc_maps:         %llu\n", priv->map_gc_maps);
+	seq_printf(s, "batch_pause_requests: %llu\n",
+		   priv->batch_pause_requests);
+	seq_printf(s, "batch_pause_acks:    %llu\n", priv->batch_pause_acks);
+	seq_printf(s, "batch_pause_cut_sequence: %llu\n",
+		   priv->batch_pause_cut_sequence);
+	seq_printf(s, "pause_program:       %llu\n",
+		   priv->batch_pause_reasons[KNOD_BPF_PAUSE_PROGRAM]);
+	seq_printf(s, "pause_host_map:      %llu\n",
+		   priv->batch_pause_reasons[KNOD_BPF_PAUSE_HOST_MAP]);
+	seq_printf(s, "pause_map_gc:        %llu\n",
+		   priv->batch_pause_reasons[KNOD_BPF_PAUSE_MAP_GC]);
+	seq_printf(s, "host_map_generation: %llu\n",
+		   priv->host_map_generation);
+	seq_printf(s, "map_visibility_before: %llu\n",
+		   priv->map_visibility_before);
+	seq_printf(s, "map_visibility_after: %llu\n",
+		   priv->map_visibility_after);
+	seq_printf(s, "map_visibility_failures: %llu\n",
+		   priv->map_visibility_failures);
+	seq_printf(s, "map_visibility_fault: %s\n",
+		   priv->map_visibility_fault ? "yes" : "no");
+	seq_printf(s, "map_visibility_before_avg_ns: %llu\n",
+		   priv->map_visibility_before ?
+		   priv->map_visibility_before_ns /
+		   priv->map_visibility_before : 0);
+	seq_printf(s, "map_visibility_after_avg_ns: %llu\n",
+		   priv->map_visibility_after ?
+		   priv->map_visibility_after_ns /
+		   priv->map_visibility_after : 0);
 
 	seq_puts(s, "\nbacklogs histogram:\n");
 	for (i = 0; i < KNOD_BL_BUCKETS; i++)

@@ -45,6 +45,8 @@
 #include <linux/sched/signal.h>
 #include "../amdgpu/amdgpu_amdkfd.h"
 #include "../amdgpu/amdgpu_gfx.h"
+#include "../amdgpu/amdgpu_res_cursor.h"
+#include "../amdgpu/amdgpu_ttm.h"
 #include "../amdgpu/./navi10_sdma_pkt_open.h"
 #include <linux/kthread.h>
 #include <linux/delay.h>
@@ -404,6 +406,134 @@ void knod_sdma_kick(struct knod *knod, int idx)
 	knod_sdma_doorbell(knod, idx);
 }
 EXPORT_SYMBOL(knod_sdma_kick);
+
+static void knod_sdma_emit_gl2_maintain(struct knod *knod, int idx,
+					u64 start, u64 end, bool writeback)
+{
+	struct knod_sdma *sdma = &knod->sdma[idx];
+	u32 ring_mask = (sdma->sdma->size / 4) - 1;
+	u64 *wptr = (u64 *)sdma->queue->kaddr + 1;
+	u32 *ptr = sdma->sdma->kaddr;
+	u32 gcr = SDMA_GCR_GL2_INV | SDMA_GCR_GL2_RANGE(2) |
+		  SDMA_GCR_RANGE_IS_PA;
+	u64 base = round_down(start, 128);
+	u64 limit = round_down(end - 1, 128);
+
+	if (writeback)
+		gcr |= SDMA_GCR_GL2_WB;
+
+	/*
+	 * SDMA 5.x and 6.x share this five-dword GCR_REQ layout. RANGE_IS_PA
+	 * makes the request independent of the HWS-owned process VMID.
+	 */
+	ptr[sdma->idx++ & ring_mask] = SDMA_PKT_HEADER_OP(SDMA_OP_GCR_REQ);
+	ptr[sdma->idx++ & ring_mask] =
+		SDMA_PKT_GCR_REQ_PAYLOAD1_BASE_VA_31_7(lower_32_bits(base) >> 7);
+	ptr[sdma->idx++ & ring_mask] =
+		SDMA_PKT_GCR_REQ_PAYLOAD2_BASE_VA_47_32(upper_32_bits(base)) |
+		SDMA_PKT_GCR_REQ_PAYLOAD2_GCR_CONTROL_15_0(gcr);
+	ptr[sdma->idx++ & ring_mask] =
+		SDMA_PKT_GCR_REQ_PAYLOAD3_LIMIT_VA_31_7(lower_32_bits(limit) >> 7) |
+		SDMA_PKT_GCR_REQ_PAYLOAD3_GCR_CONTROL_18_16(gcr >> 16);
+	ptr[sdma->idx++ & ring_mask] =
+		SDMA_PKT_GCR_REQ_PAYLOAD4_LIMIT_VA_47_32(upper_32_bits(limit)) |
+		SDMA_PKT_GCR_REQ_PAYLOAD4_VMID(0);
+
+	*wptr += 5 * 4;
+}
+
+u32 knod_sdma_gl2_maintain(struct knod *knod, int idx,
+			   struct knod_mem *const *mems, int n,
+			   bool writeback)
+{
+	struct amdgpu_device *adev = knod->process->pdds[0]->dev->adev;
+	struct knod_sdma *sdma = &knod->sdma[idx];
+	u32 capacity = sdma->sdma->size / 4;
+	u32 completed, inflight, fence;
+	struct amdgpu_res_cursor cursor;
+	u64 addr;
+	int i, nr_ranges = 0;
+
+	if ((knod->isa_version != 10 && knod->isa_version != 11) || n <= 0)
+		return 0;
+
+	/*
+	 * knod_alloc_mem() kernel-maps and pins each BO, so its TTM resource
+	 * cannot move while these physical ranges are counted and emitted.
+	 * Walk every resource segment instead of assuming a BO is contiguous.
+	 */
+	for (i = 0; i < n; i++) {
+		struct ttm_resource *res;
+
+		if (!mems[i] || !mems[i]->mem || !mems[i]->mem->bo)
+			continue;
+		res = mems[i]->mem->bo->tbo.resource;
+		if (!res || !mems[i]->mem->bo->tbo.pin_count)
+			return 0;
+		amdgpu_res_first(res, 0, mems[i]->size, &cursor);
+		while (cursor.remaining) {
+			addr = amdgpu_ttm_domain_start(adev, cursor.mem_type) +
+			       cursor.start;
+			if (WARN_ON_ONCE(addr >> 48 ||
+					 addr + cursor.size < addr ||
+					 (addr + cursor.size - 1) >> 48))
+				return 0;
+			nr_ranges++;
+			amdgpu_res_next(&cursor, cursor.size);
+		}
+	}
+	if (!nr_ranges)
+		return 0;
+
+	completed = (u32)READ_ONCE(((struct amd_signal *)
+				    sdma->queue_signal->kaddr)->value);
+	inflight = (u32)sdma->idx - completed;
+	/* Five dwords per GCR_REQ and four for its completion fence. */
+	if ((s32)(inflight + nr_ranges * 5 + 4) >= (s32)(capacity - 64))
+		return 0;
+
+	for (i = 0; i < n; i++) {
+		struct ttm_resource *res;
+
+		if (!mems[i])
+			continue;
+		res = mems[i]->mem->bo->tbo.resource;
+		amdgpu_res_first(res, 0, mems[i]->size, &cursor);
+		while (cursor.remaining) {
+			addr = amdgpu_ttm_domain_start(adev, cursor.mem_type) +
+			       cursor.start;
+			knod_sdma_emit_gl2_maintain(knod, idx, addr,
+						     addr + cursor.size,
+						     writeback);
+			amdgpu_res_next(&cursor, cursor.size);
+		}
+	}
+
+	fence = (u32)sdma->idx;
+	knod_sdma_fence(knod, sdma->queue_signal->gaddr +
+			offsetof(struct amd_signal, value), fence, idx);
+	knod_sdma_doorbell(knod, idx);
+	return fence;
+}
+EXPORT_SYMBOL(knod_sdma_gl2_maintain);
+
+int knod_sdma_wait(struct knod *knod, int idx, u32 fence, u32 timeout_us)
+{
+	struct knod_sdma *sdma = &knod->sdma[idx];
+	u64 deadline = ktime_get_ns() + (u64)timeout_us * NSEC_PER_USEC;
+	u32 completed;
+
+	do {
+		completed = (u32)READ_ONCE(((struct amd_signal *)
+					    sdma->queue_signal->kaddr)->value);
+		if ((s32)(completed - fence) >= 0)
+			return 0;
+		cpu_relax();
+	} while (ktime_get_ns() < deadline);
+
+	return -ETIMEDOUT;
+}
+EXPORT_SYMBOL(knod_sdma_wait);
 
 int knod_gart_map(struct amdgpu_device *adev, u64 npages,
 		  dma_addr_t *addr, u64 *gart_addr, u64 flags)
