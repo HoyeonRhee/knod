@@ -83,7 +83,7 @@ typedef void (*knod_flush_fn_t)(void *ctx);
 enum knod_feature {
 	KNOD_FEATURE_NONE = 0,
 	KNOD_FEATURE_BPF,
-	KNOD_FEATURE_IPSEC,
+	KNOD_FEATURE_IPSEC, /* reserved ABI value */
 	KNOD_FEATURE_MAX,
 };
 
@@ -145,8 +145,6 @@ static inline const char *knod_blob_kind_name(u32 kind)
 		[KNOD_BLOB_EPILOGUE]		 = "epilogue",
 		[KNOD_BLOB_DEFAULT_KERNEL]	 = "default kernel",
 		[KNOD_BLOB_PASS_KERNEL]		 = "pass kernel",
-		[KNOD_BLOB_IPSEC_FUSED]		 = "IPsec pipeline",
-		[KNOD_BLOB_IPSEC_BENCH]		 = "IPsec benchmark stage",
 	};
 
 	if (kind >= KNOD_BLOB_KIND_MAX || !names[kind])
@@ -311,8 +309,6 @@ struct knod *knod_alloc_ctx(struct knod_dev *knodev, int queue_cnt, int id,
 void knod_release_ctx(struct knod *knod);
 void knod_accel_xdp_register(struct knod_accel_xdp_ops *xdp_ops);
 void knod_accel_xdp_unregister(void);
-void knod_accel_ipsec_register(struct knod_accel_ipsec_ops *ipsec_ops);
-void knod_accel_ipsec_unregister(void);
 void knod_request_queue_cnt(int n);
 struct knod_mem *knod_alloc_mem(struct knod *knod, size_t size, int flags);
 struct knod_mem *__knod_alloc_mem(struct knod *knod, size_t size, int flags);

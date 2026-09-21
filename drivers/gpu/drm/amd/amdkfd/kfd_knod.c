@@ -40,8 +40,6 @@
 #include "kfd_events.h"
 #include "soc21_enum.h"
 #include "gc/gc_11_0_0_sh_mask.h"
-#include <crypto/skcipher.h>
-#include <crypto/internal/skcipher.h>
 #include <linux/pid.h>
 #include <linux/debugfs.h>
 #include <linux/sched/signal.h>
@@ -65,7 +63,7 @@ LIST_HEAD(ctx_list);
 
 /*
  * AQL/SDMA queue pair count requested by the highest-demand accel
- * consumer (currently knod_ipsec's parallel-dispatcher machinery).
+ * consumer.
  * Each accel module sets this via knod_request_queue_cnt() during its
  * module_init BEFORE the NOD attach happens, so knod_attach() creates
  * a context with enough kaql[]/sdma[] pairs for the worst-case
@@ -1734,8 +1732,6 @@ static void *knod_feature_ops(enum knod_feature feat)
 	switch (feat) {
 	case KNOD_FEATURE_BPF:
 		return registered_xdp_ops;
-	case KNOD_FEATURE_IPSEC:
-		return accel_ops.ipsec_ops;
 	default:
 		return NULL;
 	}
@@ -1765,10 +1761,6 @@ static void knod_feature_stop(struct knod *knod)
 		if (registered_xdp_ops && registered_xdp_ops->stop)
 			registered_xdp_ops->stop(knodev);
 		break;
-	case KNOD_FEATURE_IPSEC:
-		if (accel_ops.ipsec_ops && accel_ops.ipsec_ops->stop)
-			accel_ops.ipsec_ops->stop(knodev);
-		break;
 	default:
 		break;
 	}
@@ -1782,10 +1774,6 @@ static void knod_feature_start(struct knod *knod)
 	case KNOD_FEATURE_BPF:
 		if (registered_xdp_ops && registered_xdp_ops->start)
 			registered_xdp_ops->start(knodev);
-		break;
-	case KNOD_FEATURE_IPSEC:
-		if (accel_ops.ipsec_ops && accel_ops.ipsec_ops->start)
-			accel_ops.ipsec_ops->start(knodev);
 		break;
 	default:
 		knod_start_default_worker(knod);
@@ -1817,14 +1805,6 @@ static void knod_feature_deactivate(struct knod *knod)
 		knod_stop_worker(knod);
 		if (registered_xdp_ops && registered_xdp_ops->deactivate)
 			registered_xdp_ops->deactivate(knodev);
-		break;
-	case KNOD_FEATURE_IPSEC:
-		/*
-		 * knod_ipsec_detach() clears the netdev xfrm flags and runs
-		 * ->deactivate(), which NULLs ipsec_priv and does its own
-		 * synchronize_net() before freeing.
-		 */
-		knod_ipsec_detach(knodev);
 		break;
 	default:
 		break;
@@ -1864,11 +1844,6 @@ static int knod_feature_activate(struct knod *knod)
 			}
 		}
 		return 0;
-	case KNOD_FEATURE_IPSEC:
-		if (!accel_ops.ipsec_ops)
-			return -ENODEV;
-		/* knod_ipsec_attach() runs ->activate() + sets netdev flags. */
-		return knod_ipsec_attach(knodev);
 	case KNOD_FEATURE_NONE:
 		return 0;
 	default:
@@ -1925,11 +1900,6 @@ static int knod_accel_feature_set(struct knod_accel *accel, u32 feature,
 	if (knod->active_feature == KNOD_FEATURE_BPF && registered_xdp_ops &&
 	    registered_xdp_ops->busy && registered_xdp_ops->busy(knodev)) {
 		NL_SET_ERR_MSG(extack, "detach the XDP program/maps first");
-		return -EBUSY;
-	}
-	if (knod->active_feature == KNOD_FEATURE_IPSEC && accel_ops.ipsec_ops &&
-	    accel_ops.ipsec_ops->busy && accel_ops.ipsec_ops->busy(knodev)) {
-		NL_SET_ERR_MSG(extack, "remove the offloaded xfrm SAs first");
 		return -EBUSY;
 	}
 
@@ -2231,20 +2201,6 @@ void knod_accel_xdp_unregister(void)
 	WRITE_ONCE(registered_xdp_ops, NULL);
 }
 EXPORT_SYMBOL(knod_accel_xdp_unregister);
-
-void knod_accel_ipsec_register(struct knod_accel_ipsec_ops *ipsec_ops)
-{
-	/* Advertise only; resources are allocated by ->activate() on select. */
-	WRITE_ONCE(accel_ops.ipsec_ops, ipsec_ops);
-}
-EXPORT_SYMBOL(knod_accel_ipsec_register);
-
-void knod_accel_ipsec_unregister(void)
-{
-	knod_feature_force_none(KNOD_FEATURE_IPSEC);
-	WRITE_ONCE(accel_ops.ipsec_ops, NULL);
-}
-EXPORT_SYMBOL(knod_accel_ipsec_unregister);
 
 /*
  * Accel modules call this from their module_init before NOD attach to
