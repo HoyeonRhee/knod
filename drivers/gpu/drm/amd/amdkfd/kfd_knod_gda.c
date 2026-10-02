@@ -40,6 +40,12 @@ static unsigned int knod_gda_stagger = 128;
 MODULE_PARM_DESC(knod_gda_stagger, "KNOD: bytes between the offsets packets start at, a power of two (0 = one offset)");
 module_param_named(knod_gda_stagger, knod_gda_stagger, uint, 0444);
 
+static void knod_gda_wake_worker(struct knod_gda *g)
+{
+	atomic_inc(&g->worker_events);
+	wake_up(&g->pass_wq);
+}
+
 struct knod_persistent_mem {
 	struct knod_persistent_control control;
 	struct amd_signal terminal;
@@ -765,6 +771,7 @@ int knod_gda_pause(struct knod *knod, enum knod_gda_pause_reason reason)
 	WRITE_ONCE(g->pause_requested, true);
 	/* The request after the flag; pairs with the worker's acquire. */
 	smp_store_release(&g->pause_request, request);
+	knod_gda_wake_worker(g);
 	if (!READ_ONCE(g->worker)) {
 		/* No worker to restart the shader: ack for it. */
 		smp_store_release(&g->pause_ack, request);
@@ -786,6 +793,7 @@ int knod_gda_pause(struct knod *knod, enum knod_gda_pause_reason reason)
 		 */
 		/* Pairs with the worker's acquire of the flag. */
 		smp_store_release(&g->pause_requested, false);
+		knod_gda_wake_worker(g);
 		wake_up(&g->op_wq);
 		mutex_unlock(&g->op_lock);
 		return -ETIMEDOUT;
@@ -801,6 +809,7 @@ void knod_gda_resume(struct knod *knod)
 	knod_gda_unpark(knod);
 	/* The host's writes before the worker may restart the shader. */
 	smp_store_release(&g->pause_requested, false);
+	knod_gda_wake_worker(g);
 	wake_up(&g->op_wq);
 	mutex_unlock(&g->op_lock);
 }
@@ -820,7 +829,7 @@ EXPORT_SYMBOL(knod_gda_leave_paused);
  * next install.
  */
 int knod_gda_install(struct knod *knod, const void *code, u32 size,
-		     u32 lds_bytes)
+		     u32 lds_bytes, bool needs_clock)
 {
 	struct knod_gda *g = knod->gda;
 	int err;
@@ -836,6 +845,7 @@ int knod_gda_install(struct knod *knod, const void *code, u32 size,
 	g->code = code;
 	g->code_size = size;
 	g->lds_bytes = lds_bytes;
+	WRITE_ONCE(g->needs_clock, needs_clock);
 	g->code_is_default = false;
 	knod_gda_copy_code(g);
 	WRITE_ONCE(g->kernel_fault, false);
@@ -861,7 +871,7 @@ int knod_gda_install_default(struct knod *knod)
 	code = knod_gda_default_code(knod, &size);
 	if (!code)
 		return -ENOENT;
-	err = knod_gda_install(knod, code, size, 0);
+	err = knod_gda_install(knod, code, size, 0, false);
 	if (!err)
 		knod->gda->code_is_default = true;
 	return err;
@@ -874,6 +884,7 @@ EXPORT_SYMBOL(knod_gda_install_default);
 void knod_gda_mark_fault(struct knod *knod)
 {
 	WRITE_ONCE(knod->gda->kernel_fault, true);
+	knod_gda_wake_worker(knod->gda);
 }
 EXPORT_SYMBOL(knod_gda_mark_fault);
 
@@ -887,6 +898,7 @@ void knod_gda_set_client(struct knod *knod,
 	g->client = client;
 	g->client_ctx = ctx;
 	mutex_unlock(&g->client_lock);
+	knod_gda_wake_worker(g);
 }
 EXPORT_SYMBOL(knod_gda_set_client);
 
@@ -907,23 +919,31 @@ static bool knod_gda_pass_pending(struct knod_gda *g)
  * entries, look once more for any it appended before it saw the ask, and
  * sleep until the interrupt or until the rest of the loop is due.
  */
-static void knod_gda_pass_wait(struct knod_gda *g)
+static void knod_gda_pass_wait(struct knod_gda *g, unsigned int events)
 {
 	struct knod_persistent_mem *mem = knod_gda_mem(g);
+	s64 timeout = READ_ONCE(g->needs_clock) ?
+		150 * NSEC_PER_USEC : 100 * NSEC_PER_MSEC;
 
-	WRITE_ONCE(g->pass_irq, false);
-	writel(1, (void __iomem *)&mem->control.pass_wake);
-	/* Publish CPU BAR writes before the shader consumes them. */
-	wmb();
-	amdgpu_device_flush_hdp(knod_gda_adev(g), NULL);
-	/* The ask before the look; the shader appends before it reads it. */
-	mb();
-	if (knod_gda_pass_pending(g))
-		return;
+	if (!g->pass_wait_armed) {
+		WRITE_ONCE(g->pass_irq, false);
+		writel(1, (void __iomem *)&mem->control.pass_wake);
+		/* Publish the interrupt request before checking for pending PASS. */
+		wmb();
+		amdgpu_device_flush_hdp(knod_gda_adev(g), NULL);
+		g->pass_wait_armed = true;
+		/* The shader appends before reading the interrupt request. */
+		mb();
+		if (knod_gda_pass_pending(g)) {
+			g->pass_wait_armed = false;
+			return;
+		}
+	}
 	wait_event_interruptible_hrtimeout(g->pass_wq,
 					   READ_ONCE(g->pass_irq) ||
-					   kthread_should_stop(),
-					   ns_to_ktime(150 * NSEC_PER_USEC));
+					   kthread_should_stop() ||
+					   atomic_read(&g->worker_events) != events,
+					   ns_to_ktime(timeout));
 }
 
 /* A shader appended PASS entries while the worker slept (KFD interrupt). */
@@ -946,22 +966,34 @@ bool knod_gda_irq(struct kfd_process *p, u32 partial_id)
 static int knod_gda_worker(void *arg)
 {
 	struct knod_gda *g = arg;
-	unsigned int taken, n;
+	unsigned int taken, n, events;
 	u64 request, until;
 	bool pause;
 
 	while (!kthread_should_stop()) {
+		events = atomic_read(&g->worker_events);
 		mutex_lock(&g->client_lock);
 		if (g->client && g->client->tick)
 			g->client->tick(g->client_ctx);
 		mutex_unlock(&g->client_lock);
 
+		/* A timeout alone need not read or re-arm device memory. */
+		if (!READ_ONCE(g->needs_clock) && g->pass_wait_armed &&
+		    !READ_ONCE(g->pass_irq) && events == g->worker_seen_events &&
+		    time_before(jiffies, g->pass_poll_at))
+			goto wait;
+		g->worker_seen_events = events;
+		g->pass_poll_at = jiffies + HZ;
+		g->pass_wait_armed = false;
+
 		/* The program's clock: no packet carries one here. */
-		writeq(ktime_get_ns(), (void __iomem *)g->param->kaddr +
-		       offsetof(struct knod_bpf_param, ktime_ns));
-		/* Publish the clock update before the shader reads it. */
-		wmb();
-		amdgpu_device_flush_hdp(knod_gda_adev(g), NULL);
+		if (READ_ONCE(g->needs_clock)) {
+			writeq(ktime_get_ns(), (void __iomem *)g->param->kaddr +
+			       offsetof(struct knod_bpf_param, ktime_ns));
+			/* Publish the clock update before the shader reads it. */
+			wmb();
+			amdgpu_device_flush_hdp(knod_gda_adev(g), NULL);
+		}
 
 		/* Acquire a pause request and its generation. */
 		pause = smp_load_acquire(&g->pause_requested);
@@ -999,10 +1031,12 @@ static int knod_gda_worker(void *arg)
 			n = knod_gda_pass_poll(g);
 			taken += n;
 		} while (n && ktime_get_ns() < until);
-		if (taken)
+		if (taken) {
 			cond_resched();
-		else
-			knod_gda_pass_wait(g);
+		} else {
+wait:
+			knod_gda_pass_wait(g, events);
+		}
 	}
 	return 0;
 }
@@ -1014,6 +1048,7 @@ static void knod_gda_stop_worker(struct knod_gda *g)
 	task = xchg(&g->worker, NULL);
 	if (task) {
 		wake_up_all(&g->op_wq);
+		knod_gda_wake_worker(g);
 		kthread_stop(task);
 		put_task_struct(task);
 	}
